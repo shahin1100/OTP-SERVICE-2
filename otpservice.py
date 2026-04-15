@@ -1528,18 +1528,18 @@ async def message_handler(update, context):
                 await update.message.reply_text("❌ Use: /export [users|numbers|transactions]")
         
         elif text == '/reset confirm':
-            global user_balances, totp_secrets, available_numbers, pending_withdrawals, user_transactions, user_stats, temp_mail_data, user_referrals, referral_earnings
-            user_balances = {}
-            totp_secrets = {}
-            available_numbers = {}
-            pending_withdrawals = {}
-            user_transactions = {}
-            user_stats = {}
-            temp_mail_data = {}
-            user_referrals = {}
-            referral_earnings = {}
-            save_data()
-            await update.message.reply_text("✅ System reset complete! All data has been cleared.")
+    global user_balances, totp_secrets, available_numbers, pending_withdrawals, user_transactions, user_stats, temp_mail_data, user_referrals, referral_earnings
+    user_balances.clear()
+    totp_secrets.clear()
+    available_numbers.clear()
+    pending_withdrawals.clear()
+    user_transactions.clear()
+    user_stats.clear()
+    temp_mail_data.clear()
+    user_referrals.clear()
+    referral_earnings.clear()
+    save_data()
+    await update.message.reply_text("✅ System reset complete! All data has been cleared.")
         
         elif text == '/stats':
             total_users = len(user_balances)
