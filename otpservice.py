@@ -4,7 +4,7 @@ from aiogram.types import ReplyKeyboardRemove
 from aiogram.filters import Command
 
 # 🔑 BOT TOKEN
-TOKEN = "YOUR_BOT_TOKEN"
+TOKEN = "8343363851:AAEE8FbOno5w-FPmF-JdglznbeS2_tElBd4"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
