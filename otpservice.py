@@ -1,51 +1,51 @@
-import asyncio
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import ReplyKeyboardRemove
-from aiogram.filters import Command
+import telebot
+from telebot.types import ReplyKeyboardRemove
 
-# 🔑 BOT TOKEN
-TOKEN = "8343363851:AAEE8FbOno5w-FPmF-JdglznbeS2_tElBd4"
+# 🔐 NEW TOKEN (old revoke kore nibe)
+TOKEN = "8343363851:AAETAyJXJJTyCm5cWuMI5S5l3Ll70Yv_EAM"
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+bot = telebot.TeleBot(TOKEN)
 
-# 🚀 START COMMAND → auto clear
-@dp.message(Command("start"))
-async def start_cmd(message: types.Message):
-    await message.answer(
+# 🚀 START → auto clean
+@bot.message_handler(commands=['start'])
+def start(message):
+    bot.send_message(
+        message.chat.id,
         "👋 Welcome!\n\n🧹 UI cleaned successfully.",
         reply_markup=ReplyKeyboardRemove()
     )
 
 # 🧹 CLEAR COMMAND
-@dp.message(Command("clear"))
-async def clear_cmd(message: types.Message):
-    await message.answer(
+@bot.message_handler(commands=['clear'])
+def clear(message):
+    bot.send_message(
+        message.chat.id,
         "✅ All buttons removed!",
         reply_markup=ReplyKeyboardRemove()
     )
 
-# 🧨 AUTO REMOVE ANY MESSAGE KEYBOARD
-@dp.message()
-async def auto_clear(message: types.Message):
-    await message.answer(
+# 🧨 AUTO CLEAR (any message)
+@bot.message_handler(func=lambda m: True)
+def auto_clear(message):
+    bot.send_message(
+        message.chat.id,
         "🧹 Clean mode active",
         reply_markup=ReplyKeyboardRemove()
     )
 
-# ❌ REMOVE INLINE BUTTON (callback)
-@dp.callback_query()
-async def remove_inline(call: types.CallbackQuery):
+# ❌ INLINE BUTTON REMOVE
+@bot.callback_query_handler(func=lambda call: True)
+def remove_inline(call):
     try:
-        await call.message.edit_reply_markup(reply_markup=None)
+        bot.edit_message_reply_markup(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            reply_markup=None
+        )
     except:
         pass
-    await call.answer("❌ Buttons removed")
+    bot.answer_callback_query(call.id, "❌ Buttons removed")
 
-# ▶️ RUN BOT
-async def main():
-    print("🤖 Bot Running...")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ▶️ RUN
+print("🤖 Bot Running...")
+bot.infinity_polling()
