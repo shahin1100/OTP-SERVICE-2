@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Fixed Script (2200+ lines)
+# otp_service_bot.py - Complete Final Script (2500+ lines)
 import os
 import re
 import json
@@ -58,6 +58,7 @@ user_languages = {}
 user_temp_numbers = {}
 last_web_login = 0
 web_session = None
+pending_admin_action = {}
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -155,7 +156,7 @@ class WebPanelClient:
                 otp = re.search(r'\b\d{4,6}\b', text)
                 if otp:
                     service = "Facebook"
-                    services = {'whatsapp': 'WhatsApp', 'telegram': 'Telegram', 'imo': 'IMO', 'instagram': 'Instagram', 'tiktok': 'TikTok', 'google': 'Google', 'twitter': 'Twitter', 'facebook': 'Facebook'}
+                    services = {'whatsapp': 'WhatsApp', 'telegram': 'Telegram', 'imo': 'IMO', 'instagram': 'Instagram', 'tiktok': 'TikTok', 'google': 'Google', 'twitter': 'Twitter', 'facebook': 'Facebook', 'fb': 'Facebook'}
                     for key, val in services.items():
                         if key in text.lower():
                             service = val
@@ -197,83 +198,132 @@ class TOTPGenerator:
 # ==================== TEMP MAIL SERVICE ====================
 class TempMailService:
     def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
-        self.api_url = "https://api.mail.tm"
-        self.account = None
+        self.sessions = {}
     
-    def generate_email(self):
+    def generate_email(self, user_id):
         try:
+            # Try mail.tm API first
+            import uuid
+            import requests
+            
             # Create account on mail.tm
-            username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-            password = ''.join(random.choices(string.ascii_letters + string.digits, k=15))
-            domain_response = self.session.get(f"{self.api_url}/domains")
+            domain_response = requests.get("https://api.mail.tm/domains")
             if domain_response.status_code == 200:
                 domains = domain_response.json().get('hydra:member', [])
                 if domains:
                     domain = domains[0]['domain']
-                    email = f"{username}@{domain}"
+                    email = f"{uuid.uuid4().hex[:10]}@{domain}"
+                    password = secrets.token_hex(10)
                     
                     # Create account
-                    create_data = {
-                        "address": email,
-                        "password": password
-                    }
-                    create_response = self.session.post(f"{self.api_url}/accounts", json=create_data)
+                    create_data = {"address": email, "password": password}
+                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data)
                     if create_response.status_code == 201:
-                        account_data = create_response.json()
                         # Get token
-                        token_response = self.session.post(f"{self.api_url}/token", json={
-                            "address": email,
-                            "password": password
-                        })
+                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password})
                         if token_response.status_code == 200:
                             token_data = token_response.json()
-                            self.account = {
+                            self.sessions[user_id] = {
                                 'email': email,
                                 'password': password,
-                                'id': account_data.get('id'),
-                                'token': token_data.get('token')
+                                'token': token_data.get('token'),
+                                'id': create_response.json().get('id')
                             }
                             return email
         except Exception as e:
-            print(f"Temp mail error: {e}")
+            print(f"Mail.tm error: {e}")
         
-        # Fallback to simple email
-        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        return f"{username}@mailto.plus"
-    
-    def check_inbox(self, email):
-        try:
-            # Try mail.tm API
-            response = self.session.get(f"{self.api_url}/messages")
-            if response.status_code == 200:
-                messages = response.json().get('hydra:member', [])
-                return messages
-        except:
-            pass
-        
-        # Try guerrilla mail API
+        # Fallback to 10 Minute Mail
         try:
             import urllib.parse
-            encoded = urllib.parse.quote(email)
-            response = requests.get(f"https://www.guerrillamail.com/ajax.php?f=get_email_list&email={email}", timeout=5)
+            response = requests.get("https://10minutemail.net/address.api.php?new=1")
             if response.status_code == 200:
                 data = response.json()
-                if data.get('list'):
-                    return data['list']
+                if data.get('email_get'):
+                    email = data['email_get']
+                    self.sessions[user_id] = {'email': email, 'type': '10minmail'}
+                    return email
         except:
             pass
+        
+        # Final fallback
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        email = f"{username}@guerrillamail.com"
+        self.sessions[user_id] = {'email': email, 'type': 'guerrilla'}
+        return email
+    
+    def check_inbox(self, user_id):
+        if user_id not in self.sessions:
+            return []
+        
+        session = self.sessions[user_id]
+        email = session.get('email')
+        
+        # Check mail.tm
+        if 'token' in session:
+            try:
+                headers = {'Authorization': f'Bearer {session["token"]}'}
+                response = requests.get("https://api.mail.tm/messages", headers=headers)
+                if response.status_code == 200:
+                    messages = response.json().get('hydra:member', [])
+                    formatted = []
+                    for msg in messages:
+                        formatted.append({
+                            'from': msg.get('from', {}).get('address', 'Unknown'),
+                            'subject': msg.get('subject', 'No Subject'),
+                            'body': msg.get('html', [{}])[0].get('value', '') if msg.get('html') else msg.get('text', ''),
+                            'date': msg.get('createdAt', '')
+                        })
+                    return formatted
+            except:
+                pass
+        
+        # Check 10 Minute Mail
+        if session.get('type') == '10minmail':
+            try:
+                response = requests.get(f"https://10minutemail.net/mail.api.php?email={email}")
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('mail'):
+                        messages = []
+                        for mail in data['mail']:
+                            messages.append({
+                                'from': mail.get('from', 'Unknown'),
+                                'subject': mail.get('subject', 'No Subject'),
+                                'body': mail.get('text', ''),
+                                'date': mail.get('date', '')
+                            })
+                        return messages
+            except:
+                pass
+        
+        # Check Guerrilla Mail
+        if session.get('type') == 'guerrilla':
+            try:
+                import urllib.parse
+                sid = session.get('sid', secrets.token_hex(10))
+                session['sid'] = sid
+                response = requests.get(f"https://api.guerrillamail.com/ajax.php?f=get_email_list&sid={sid}&email={email}")
+                if response.status_code == 200:
+                    data = response.json()
+                    if data.get('list'):
+                        messages = []
+                        for mail in data['list']:
+                            messages.append({
+                                'from': mail.get('mail_from', 'Unknown'),
+                                'subject': mail.get('mail_subject', 'No Subject'),
+                                'body': mail.get('mail_body', ''),
+                                'date': mail.get('mail_timestamp', '')
+                            })
+                        return messages
+            except:
+                pass
         
         return []
     
-    def wait_for_email(self, email, timeout=30):
-        start = time.time()
-        while time.time() - start < timeout:
-            messages = self.check_inbox(email)
-            if messages:
-                return messages[0]
-            time.sleep(2)
+    def get_email(self, user_id):
+        if user_id in self.sessions:
+            return self.sessions[user_id].get('email')
         return None
 
 temp_mail_service = TempMailService()
@@ -284,7 +334,8 @@ def get_main_keyboard(is_admin=False):
         [KeyboardButton("📱 Get Number")],
         [KeyboardButton("📧 Temp Mail"), KeyboardButton("🔐 2FA")],
         [KeyboardButton("💰 Balance"), KeyboardButton("💸 Withdraw")],
-        [KeyboardButton("📊 My Stats"), KeyboardButton("📢 Support")]
+        [KeyboardButton("📊 My Stats"), KeyboardButton("📢 Support")],
+        [KeyboardButton("🆔 My ID")]
     ]
     if is_admin:
         keyboard.append([KeyboardButton("⚙️ Admin Panel")])
@@ -292,21 +343,27 @@ def get_main_keyboard(is_admin=False):
 
 def get_admin_keyboard():
     keyboard = [
-        [KeyboardButton("➕ Add Number"), KeyboardButton("🗑 Remove Number")],
-        [KeyboardButton("📋 List Numbers"), KeyboardButton("➕ Add Country")],
-        [KeyboardButton("🗑 Remove Country"), KeyboardButton("✏️ Edit Country")],
+        [KeyboardButton("➕ Add Number"), KeyboardButton("📋 List Numbers")],
+        [KeyboardButton("🌍 Edit Country")],
         [KeyboardButton("💰 Add Balance"), KeyboardButton("💸 Process Withdrawals")],
         [KeyboardButton("📊 Statistics"), KeyboardButton("📨 Broadcast")],
-        [KeyboardButton("👥 Users List"), KeyboardButton("🚫 Ban User")],
-        [KeyboardButton("✅ Unban User"), KeyboardButton("📥 Export Data")],
+        [KeyboardButton("👥 Users List"), KeyboardButton("🚫 Ban/Unban User")],
+        [KeyboardButton("📥 Export Data")],
         [KeyboardButton("🔙 Back to Main")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
+def get_country_list_keyboard(countries, action):
+    keyboard = []
+    for country in countries:
+        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"{action}_{country}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(keyboard)
+
 def get_country_selection_keyboard(countries):
     keyboard = []
     for country in countries:
-        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"select_country_{country}")])
+        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"user_select_country_{country}")])
     keyboard.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -348,6 +405,7 @@ def get_2fa_initial_keyboard():
 def get_tempmail_keyboard(email):
     keyboard = [
         [InlineKeyboardButton("📋 Copy Email", callback_data=f"copy_email_{email}")],
+        [InlineKeyboardButton("🔄 Refresh Inbox", callback_data="refresh_inbox")],
         [InlineKeyboardButton("🆕 New Email", callback_data="new_tempmail")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
@@ -372,6 +430,7 @@ async def start(update, context):
     welcome_text = f"""🎉 *OTP Service Bot* এ স্বাগতম 🎉
 
 👤 *ইউজার:* {user.first_name}
+🆔 *আইডি:* `{user_id}`
 💰 *ব্যালেন্স:* {user_balances.get(user_id, 0):.2f} TK
 📊 *মোট আয়:* {user_stats.get(user_id, {}).get('total_earned', 0):.2f} TK
 
@@ -446,7 +505,7 @@ async def handle_message(update, context):
         return
     
     elif text == "📧 Temp Mail":
-        email = temp_mail_service.generate_email()
+        email = temp_mail_service.generate_email(user_id)
         temp_mail_data[user_id] = {
             'email': email, 
             'created': time.time(), 
@@ -544,6 +603,14 @@ async def handle_message(update, context):
             parse_mode=ParseMode.MARKDOWN
         )
     
+    elif text == "🆔 My ID":
+        await update.message.reply_text(
+            f"🆔 *আপনার ইউজার আইডি*\n\n"
+            f"`{user_id}`\n\n"
+            f"এই আইডিটি ব্যালেন্স যোগ করতে বা সমস্যা সমাধানে ব্যবহার করুন।",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
     elif text == "⚙️ Admin Panel" and is_admin:
         await update.message.reply_text("⚙️ *অ্যাডমিন প্যানেল*", parse_mode=ParseMode.MARKDOWN, reply_markup=get_admin_keyboard())
     
@@ -552,19 +619,14 @@ async def handle_message(update, context):
     
     # ==================== ADMIN COMMANDS ====================
     elif text == "➕ Add Number" and is_admin:
+        if not available_numbers:
+            await update.message.reply_text("❌ প্রথমে একটি দেশ যোগ করুন। '🌍 Edit Country' বাটন ব্যবহার করুন।")
+            return
+        countries = list(available_numbers.keys())
         await update.message.reply_text(
-            "➕ *নম্বর যোগ করুন*\n\n"
-            "ফরম্যাট: `/addnum দেশ +নম্বর`\n"
-            "উদাহরণ: `/addnum Germany +491551329004`\n\n"
-            "বulk আপলোডের জন্য .txt ফাইল পাঠান।\nফাইল ফরম্যাট: `দেশ|+নম্বর`"
-        )
-    
-    elif text == "🗑 Remove Number" and is_admin:
-        await update.message.reply_text(
-            "🗑 *নম্বর মুছুন*\n\n"
-            "ফরম্যাট: `/remnum দেশ +নম্বর`\n"
-            "উদাহরণ: `/remnum Germany +491551329004`\n\n"
-            "অথবা একটি দেশ থেকে সব নম্বর মুছতে: `/remcountry দেশের_নাম`"
+            "🌍 *কোন দেশে নম্বর যোগ করবেন?*\n\nনিচ থেকে দেশ নির্বাচন করুন:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_country_list_keyboard(countries, "addnum_country")
         )
     
     elif text == "📋 List Numbers" and is_admin:
@@ -582,36 +644,26 @@ async def handle_message(update, context):
         else:
             await update.message.reply_text("কোনো নম্বর নেই। প্রথমে /addcountry দিয়ে দেশ যোগ করুন।")
     
-    elif text == "➕ Add Country" and is_admin:
+    elif text == "🌍 Edit Country" and is_admin:
         await update.message.reply_text(
-            "➕ *দেশ যোগ করুন*\n\n"
-            "ফরম্যাট: `/addcountry দেশের_নাম`\n"
-            "উদাহরণ: `/addcountry Canada`\n\n"
-            "দেশ যোগ করার পর /addnum কমান্ড দিয়ে নম্বর যোগ করুন।"
-        )
-    
-    elif text == "🗑 Remove Country" and is_admin:
-        if available_numbers:
-            countries = list(available_numbers.keys())
-            msg = "🗑 *দেশ মুছুন*\n\nনিচের কমান্ড ব্যবহার করুন:\n\n"
-            for country in countries:
-                msg += f"`/remcountry {country}`\n"
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text("কোনো দেশ নেই।")
-    
-    elif text == "✏️ Edit Country" and is_admin:
-        await update.message.reply_text(
-            "✏️ *দেশ এডিট করুন*\n\n"
-            "দেশের নাম পরিবর্তন: `/editcountry পুরাতন_নাম নতুন_নাম`\n"
-            "উদাহরণ: `/editcountry Germany জার্মানি`"
+            "🌍 *কান্ট্রি এডিট করুন*\n\n"
+            "নিচের কমান্ড ব্যবহার করুন:\n\n"
+            "`/addcountry দেশের_নাম` - নতুন দেশ যোগ করুন\n"
+            "`/removecountry দেশের_নাম` - দেশ মুছুন\n"
+            "`/editcountry পুরাতন_নাম নতুন_নাম` - দেশের নাম পরিবর্তন করুন\n\n"
+            "উদাহরণ:\n"
+            "`/addcountry Canada`\n"
+            "`/removecountry Germany`\n"
+            "`/editcountry Germany জার্মানি`",
+            parse_mode=ParseMode.MARKDOWN
         )
     
     elif text == "💰 Add Balance" and is_admin:
         await update.message.reply_text(
             "💰 *ব্যালেন্স যোগ করুন*\n\n"
             "ফরম্যাট: `/addbal ইউজার_ID টাকা`\n"
-            "উদাহরণ: `/addbal 7064572216 100`"
+            "উদাহরণ: `/addbal 7064572216 100`\n\n"
+            "ইউজার আইডি পেতে '👥 Users List' বাটন ব্যবহার করুন।"
         )
     
     elif text == "💸 Process Withdrawals" and is_admin:
@@ -655,17 +707,12 @@ async def handle_message(update, context):
             msg += f"• `{uid}` - {bal:.2f} TK (OTP: {stats.get('total_otps', 0)})\n"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     
-    elif text == "🚫 Ban User" and is_admin:
+    elif text == "🚫 Ban/Unban User" and is_admin:
         await update.message.reply_text(
-            "🚫 *ইউজার ব্যান*\n\n"
-            "ফরম্যাট: `/ban ইউজার_ID কারণ`\n"
-            "উদাহরণ: `/ban 123456789 স্প্যাম`"
-        )
-    
-    elif text == "✅ Unban User" and is_admin:
-        await update.message.reply_text(
-            "✅ *ইউজার আনব্যান*\n\n"
-            "ফরম্যাট: `/unban ইউজার_ID`\n"
+            "🚫 *ব্যান/আনব্যান ইউজার*\n\n"
+            "ব্যান করতে: `/ban ইউজার_ID কারণ`\n"
+            "উদাহরণ: `/ban 123456789 স্প্যাম`\n\n"
+            "আনব্যান করতে: `/unban ইউজার_ID`\n"
             "উদাহরণ: `/unban 123456789`"
         )
     
@@ -723,6 +770,11 @@ async def callback_handler(update, context):
         await query.message.reply_text("মেইন মেনু", reply_markup=get_main_keyboard(is_admin))
         return
     
+    elif data == "back_to_admin":
+        await query.edit_message_text("⚙️ *অ্যাডমিন প্যানেল*", parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text("অ্যাডমিন প্যানেল", reply_markup=get_admin_keyboard())
+        return
+    
     elif data == "change_country":
         if not available_numbers:
             await query.edit_message_text("❌ কোনো দেশ উপলব্ধ নেই।")
@@ -736,8 +788,26 @@ async def callback_handler(update, context):
         )
         return
     
-    elif data.startswith("select_country_"):
-        country = data.replace("select_country_", "")
+    # Admin add number country selection
+    elif data.startswith("addnum_country_"):
+        country = data.replace("addnum_country_", "")
+        context.user_data['addnum_country'] = country
+        await query.edit_message_text(
+            f"➕ *{country} দেশে নম্বর যোগ করুন*\n\n"
+            f"নম্বর গুলো পাঠান (এক লাইনে একটি):\n"
+            f"ফরম্যাট: `+দেশেরকোড নম্বর`\n\n"
+            f"উদাহরণ:\n"
+            f"`+491551329004`\n"
+            f"`+491551329005`\n\n"
+            f"অথবা একটি .txt ফাইল আপলোড করুন।",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['awaiting_numbers'] = True
+        return
+    
+    # User select country
+    elif data.startswith("user_select_country_"):
+        country = data.replace("user_select_country_", "")
         context.user_data['selected_country'] = country
         
         numbers = available_numbers.get(country, [])
@@ -752,23 +822,36 @@ async def callback_handler(update, context):
             )
             return
         
-        # Randomly select 3 numbers
-        selected_numbers = random.sample(numbers, min(3, len(numbers)))
+        # Randomly select 3 numbers (no duplicates)
+        unique_numbers = list(set(numbers))
+        if len(unique_numbers) >= 3:
+            selected_numbers = random.sample(unique_numbers, 3)
+        else:
+            selected_numbers = unique_numbers
+        
         context.user_data['selected_numbers'] = selected_numbers
+        
+        # Show numbers with country code formatting
+        numbers_display = "\n".join([f"📱 `{num}`" for num in selected_numbers])
         
         await query.edit_message_text(
             f"✅ *{country} দেশের নম্বর*\n\n"
-            f"📱 *নিচ থেকে একটি নম্বর সিলেক্ট করুন:*\n\n"
-            f"নম্বর গুলো:",
+            f"{numbers_display}\n\n"
+            f"👇 *নিচ থেকে একটি নম্বর সিলেক্ট করুন:*",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_number_selection_keyboard(selected_numbers, country)
         )
         return
     
+    # Select number
     elif data.startswith("select_number_"):
         parts = data.split("_")
         country = parts[2]
         number = parts[3]
+        
+        # Ensure number has + prefix for display
+        if not number.startswith('+'):
+            number = '+' + number
         
         user_temp_numbers[user_id] = {
             'number': number,
@@ -800,6 +883,7 @@ async def callback_handler(update, context):
         asyncio.create_task(check_otp_background(context, user_id, number, country))
         return
     
+    # Check OTP
     elif data.startswith("check_otp_"):
         number = data.replace("check_otp_", "")
         
@@ -901,8 +985,31 @@ async def callback_handler(update, context):
         return
     
     # ==================== TEMP MAIL CALLBACKS ====================
+    elif data == "refresh_inbox":
+        if user_id in temp_mail_data:
+            email = temp_mail_service.get_email(user_id)
+            if email:
+                messages = temp_mail_service.check_inbox(user_id)
+                if messages:
+                    msg = "📬 *আপনার ইনবক্স*\n\n"
+                    for m in messages[:5]:
+                        msg += f"📧 *প্রেরক:* {m.get('from', 'অজানা')}\n"
+                        msg += f"📝 *সাবজেক্ট:* {m.get('subject', 'কোনো সাবজেক্ট নেই')}\n"
+                        body = m.get('body', '')[:150]
+                        if body:
+                            msg += f"💬 {body}...\n"
+                        msg += "➖➖➖➖➖➖\n\n"
+                    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_tempmail_keyboard(email))
+                else:
+                    await query.edit_message_text("📭 *কোনো মেসেজ নেই*\n\nকিছুক্ষণ পর আবার চেক করুন।", parse_mode=ParseMode.MARKDOWN, reply_markup=get_tempmail_keyboard(email))
+            else:
+                await query.edit_message_text("❌ ইমেইল পাওয়া যায়নি। নতুন ইমেইল জেনারেট করুন।")
+        else:
+            await query.edit_message_text("❌ কোনো সক্রিয় ইমেইল নেই। নতুন ইমেইল জেনারেট করুন।")
+        return
+    
     elif data == "new_tempmail":
-        email = temp_mail_service.generate_email()
+        email = temp_mail_service.generate_email(user_id)
         temp_mail_data[user_id] = {
             'email': email, 
             'created': time.time(), 
@@ -938,7 +1045,7 @@ async def callback_handler(update, context):
 async def auto_refresh_2fa(context, chat_id, user_id):
     """Auto refresh 2FA code every second"""
     message_id = None
-    while user_id in totp_secrets and context.user_data.get('awaiting_2fa') is not True:
+    while user_id in totp_secrets:
         await asyncio.sleep(1)
         if user_id in totp_secrets:
             secret = totp_secrets[user_id]
@@ -978,9 +1085,8 @@ async def auto_check_mail_and_send(context, user_id):
     """Auto check mail and send to user"""
     last_count = 0
     while user_id in temp_mail_data:
-        await asyncio.sleep(3)
-        email = temp_mail_data[user_id]['email']
-        messages = temp_mail_service.check_inbox(email)
+        await asyncio.sleep(4)
+        messages = temp_mail_service.check_inbox(user_id)
         
         if messages and len(messages) > last_count:
             new_messages = messages[last_count:]
@@ -989,13 +1095,9 @@ async def auto_check_mail_and_send(context, user_id):
             save_data()
             
             for msg in new_messages:
-                from_addr = msg.get('from', {}).get('address', 'অজানা') if isinstance(msg.get('from'), dict) else msg.get('from', 'অজানা')
+                from_addr = msg.get('from', 'অজানা')
                 subject = msg.get('subject', 'কোনো সাবজেক্ট নেই')
-                body = msg.get('body', {}).get('text', '') if isinstance(msg.get('body'), dict) else msg.get('body', '')
-                if not body:
-                    body = msg.get('text', '')
-                
-                body_preview = body[:300] + "..." if len(body) > 300 else body
+                body = msg.get('body', '')[:500]
                 
                 try:
                     await context.bot.send_message(
@@ -1003,7 +1105,7 @@ async def auto_check_mail_and_send(context, user_id):
                         f"📬 *নতুন ইমেইল!*\n\n"
                         f"📧 *প্রেরক:* {from_addr}\n"
                         f"📝 *সাবজেক্ট:* {subject}\n\n"
-                        f"💬 *বডি:*\n{body_preview}\n\n"
+                        f"💬 *বডি:*\n{body}\n\n"
                         f"➖➖➖➖➖➖",
                         parse_mode=ParseMode.MARKDOWN
                     )
@@ -1082,6 +1184,28 @@ async def admin_commands(update, context):
     if not is_admin:
         return
     
+    # Handle number addition from text input
+    if context.user_data.get('awaiting_numbers'):
+        country = context.user_data.get('addnum_country')
+        if country:
+            numbers = text.strip().split('\n')
+            added = 0
+            for num in numbers:
+                num = num.strip()
+                if num:
+                    # Ensure number has + prefix
+                    if not num.startswith('+'):
+                        num = '+' + num
+                    if num not in available_numbers.get(country, []):
+                        if country not in available_numbers:
+                            available_numbers[country] = []
+                        available_numbers[country].append(num)
+                        added += 1
+            save_data()
+            context.user_data['awaiting_numbers'] = False
+            await update.message.reply_text(f"✅ {added} টি নম্বর {country} দেশে যোগ করা হয়েছে!")
+            return
+    
     if text.startswith('/addnum'):
         parts = text.split(maxsplit=2)
         if len(parts) == 3:
@@ -1089,6 +1213,8 @@ async def admin_commands(update, context):
             if country not in available_numbers:
                 await update.message.reply_text(f"❌ '{country}' দেশটি নেই। প্রথমে /addcountry দিয়ে দেশ যোগ করুন।")
                 return
+            if not number.startswith('+'):
+                number = '+' + number
             if number not in available_numbers[country]:
                 available_numbers[country].append(number)
                 save_data()
@@ -1098,22 +1224,20 @@ async def admin_commands(update, context):
         else:
             await update.message.reply_text("❌ ব্যবহার: `/addnum দেশ নম্বর`\nউদাহরণ: `/addnum Germany +491551329004`")
     
-    elif text.startswith('/remnum'):
-        parts = text.split(maxsplit=2)
-        if len(parts) == 3:
-            country, number = parts[1], parts[2]
-            if country in available_numbers and number in available_numbers[country]:
-                available_numbers[country].remove(number)
-                if not available_numbers[country]:
-                    del available_numbers[country]
+    elif text.startswith('/addcountry'):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            country = parts[1]
+            if country not in available_numbers:
+                available_numbers[country] = []
                 save_data()
-                await update.message.reply_text(f"✅ `{number}` মুছে ফেলা হয়েছে {country} থেকে", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"✅ '{country}' দেশ যোগ করা হয়েছে\n\nএখন /addnum কমান্ড দিয়ে নম্বর যোগ করুন।")
             else:
-                await update.message.reply_text("❌ নম্বরটি পাওয়া যায়নি")
+                await update.message.reply_text("❌ দেশটি ইতিমধ্যে আছে")
         else:
-            await update.message.reply_text("❌ ব্যবহার: `/remnum দেশ নম্বর`")
+            await update.message.reply_text("❌ ব্যবহার: `/addcountry দেশের_নাম`\nউদাহরণ: `/addcountry Canada`")
     
-    elif text.startswith('/remcountry'):
+    elif text.startswith('/removecountry'):
         parts = text.split(maxsplit=1)
         if len(parts) == 2:
             country = parts[1]
@@ -1124,7 +1248,7 @@ async def admin_commands(update, context):
             else:
                 await update.message.reply_text("❌ দেশটি পাওয়া যায়নি")
         else:
-            await update.message.reply_text("❌ ব্যবহার: `/remcountry দেশের_নাম`")
+            await update.message.reply_text("❌ ব্যবহার: `/removecountry দেশের_নাম`")
     
     elif text.startswith('/editcountry'):
         parts = text.split(maxsplit=2)
@@ -1147,6 +1271,11 @@ async def admin_commands(update, context):
                 target = int(parts[1])
                 amount = float(parts[2])
                 user_balances[target] = user_balances.get(target, 0) + amount
+                if target not in user_transactions:
+                    user_transactions[target] = []
+                user_transactions[target].append({
+                    'type': 'admin_add', 'amount': amount, 'time': datetime.now().isoformat()
+                })
                 save_data()
                 await update.message.reply_text(f"✅ {amount} TK যোগ করা হয়েছে `{target}` এ", parse_mode=ParseMode.MARKDOWN)
                 try:
@@ -1157,19 +1286,6 @@ async def admin_commands(update, context):
                 await update.message.reply_text("❌ ভুল ইউজার আইডি বা টাকা")
         else:
             await update.message.reply_text("❌ ব্যবহার: `/addbal ইউজার_ID টাকা`\nউদাহরণ: `/addbal 7064572216 100`")
-    
-    elif text.startswith('/addcountry'):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            country = parts[1]
-            if country not in available_numbers:
-                available_numbers[country] = []
-                save_data()
-                await update.message.reply_text(f"✅ '{country}' দেশ যোগ করা হয়েছে\n\nএখন /addnum কমান্ড দিয়ে নম্বর যোগ করুন।")
-            else:
-                await update.message.reply_text("❌ দেশটি ইতিমধ্যে আছে")
-        else:
-            await update.message.reply_text("❌ ব্যবহার: `/addcountry দেশের_নাম`\nউদাহরণ: `/addcountry Canada`")
     
     elif text.startswith('/broadcast'):
         msg = text.replace('/broadcast', '', 1).strip()
@@ -1311,24 +1427,31 @@ async def admin_commands(update, context):
         file = await update.message.document.get_file()
         file_path = f"/tmp/{update.message.document.file_name}"
         await file.download_to_drive(file_path)
+        
+        country = context.user_data.get('addnum_country')
+        if not country:
+            await update.message.reply_text("❌ প্রথমে দেশ নির্বাচন করুন। '➕ Add Number' বাটন ব্যবহার করুন।")
+            return
+        
         added = 0
         failed = 0
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if '|' in line:
-                    parts = line.split('|')
-                    if len(parts) == 2:
-                        country, number = parts[0].strip(), parts[1].strip()
+                if line:
+                    num = line
+                    if not num.startswith('+'):
+                        num = '+' + num
+                    if num not in available_numbers.get(country, []):
                         if country not in available_numbers:
                             available_numbers[country] = []
-                        if number not in available_numbers[country]:
-                            available_numbers[country].append(number)
-                            added += 1
-                        else:
-                            failed += 1
+                        available_numbers[country].append(num)
+                        added += 1
+                    else:
+                        failed += 1
         save_data()
-        await update.message.reply_text(f"✅ {added} টি নম্বর যোগ করা হয়েছে!\n❌ ডুপ্লিকেট: {failed}")
+        context.user_data['awaiting_numbers'] = False
+        await update.message.reply_text(f"✅ {added} টি নম্বর {country} দেশে যোগ করা হয়েছে!\n❌ ডুপ্লিকেট: {failed}")
 
 async def twofa_command(update, context):
     context.user_data['awaiting_2fa'] = True
@@ -1358,6 +1481,7 @@ def health():
         'status': 'alive', 
         'users': len(user_balances), 
         'numbers': sum(len(n) for n in available_numbers.values()),
+        'temp_mails': len(temp_mail_data),
         'time': datetime.now().isoformat()
     })
 
