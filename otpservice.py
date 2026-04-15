@@ -23,7 +23,7 @@ from bs4 import BeautifulSoup
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8343363851:AAEE8FbOno5w-FPmF-JdglznbeS2_tElBd4"
 ADMIN_ID = 7064572216
-BOT_USERNAME = "GetPaidOTP2Bot"
+BOT_USERNAME = "@OtpServices2_Bot"
 MAIN_CHANNEL = "@OtpService2C"
 OTP_GROUP = "@OtpService2G"
 WEB_BASE_URL = "http://139.99.9.4/ints"
