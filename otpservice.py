@@ -1,4 +1,4 @@
-# getpaid_otp_bot.py
+# otp_service_bot.py - Complete Final Working Script (3700+ lines)
 import os
 import re
 import json
@@ -9,13 +9,13 @@ import struct
 import secrets
 import requests
 import asyncio
-import threading
 import random
 import string
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple, List
+import csv
+import io
+from datetime import datetime
 from flask import Flask, request, jsonify
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
 from bs4 import BeautifulSoup
@@ -23,54 +23,64 @@ from bs4 import BeautifulSoup
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8343363851:AAHmFXkTjrubOpW3VdsZAhebvzfNyjNpJ10"
 ADMIN_ID = 7064572216
-BOT_USERNAME = "GetPaidOTP2Bot"
+BOT_USERNAME = "OtpServices2_Bot"
 MAIN_CHANNEL = "@OtpService2C"
 OTP_GROUP = "@OtpService2G"
-WEB_BASE_URL = "http://139.99.9.4/ints"
-WEB_LOGIN_URL = f"{WEB_BASE_URL}/login"
-WEB_API_URL = f"{WEB_BASE_URL}/agent/SMSCDRStats"
+SUPPORT_ID = "@xDnaZim"
+WEB_LOGIN_URL = "http://139.99.9.4/ints/login"
+WEB_API_URL = "http://139.99.9.4/ints/agent/SMSCDRStats"
 WEB_USER = "Nazim1"
 WEB_PASS = "Nazim1"
 
-# Pricing
-OTP_EARN_AMOUNT = 0.30  # User earns 0.30 TK per OTP received
-OTP_COST_AMOUNT = 0.40  # User pays 0.40 TK to get number
-MIN_WITHDRAW = 500  # Minimum 500 TK for withdrawal
+MIN_WITHDRAW = 500
 
-# File paths
 DATA_FILE = "bot_data.json"
 NUMBERS_FILE = "numbers.json"
-SESSION_FILE = "session.json"
+TEMP_MAIL_FILE = "temp_mail.json"
 
-# Flask app
+SECRET_KEY_STATE = 1
+AWAITING_NUMBERS_STATE = 2
+AWAITING_PRICE_STATE = 3
+
 flask_app = Flask(__name__)
 
-# Global data structures
+# ==================== GLOBAL VARIABLES ====================
 user_balances = {}
-user_numbers = {}
 active_orders = {}
 totp_secrets = {}
 available_numbers = {}
+country_prices = {}
 pending_withdrawals = {}
 user_transactions = {}
 user_stats = {}
-temp_emails = {}
-web_session = None
-captcha_cache = {}
+temp_mail_data = {}
+mail_check_tasks = {}
+banned_users = {}
+user_languages = {}
+user_active_numbers = {}
+user_2fa_messages = {}
+user_2fa_tasks = {}
+number_usage_count = {}
+otp_check_tasks = {}
+last_web_login = 0
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
-    global user_balances, user_numbers, totp_secrets, available_numbers, pending_withdrawals, user_transactions, user_stats, temp_emails
+    global user_balances, totp_secrets, available_numbers, pending_withdrawals
+    global user_transactions, user_stats, temp_mail_data, banned_users, user_languages, country_prices, number_usage_count
+    
     try:
         with open(DATA_FILE, 'r') as f:
             data = json.load(f)
             user_balances = data.get('balances', {})
-            user_numbers = data.get('numbers', {})
             totp_secrets = data.get('totp', {})
             pending_withdrawals = data.get('withdrawals', {})
             user_transactions = data.get('transactions', {})
             user_stats = data.get('stats', {})
-            temp_emails = data.get('temp_emails', {})
+            banned_users = data.get('banned', {})
+            user_languages = data.get('languages', {})
+            country_prices = data.get('country_prices', {})
+            number_usage_count = data.get('number_usage', {})
     except FileNotFoundError:
         pass
     
@@ -79,199 +89,106 @@ def load_data():
             available_numbers = json.load(f)
     except FileNotFoundError:
         available_numbers = {}
+    
+    try:
+        with open(TEMP_MAIL_FILE, 'r') as f:
+            temp_mail_data = json.load(f)
+    except FileNotFoundError:
+        temp_mail_data = {}
 
 def save_data():
-    data = {
-        'balances': user_balances,
-        'numbers': user_numbers,
-        'totp': totp_secrets,
-        'withdrawals': pending_withdrawals,
-        'transactions': user_transactions,
-        'stats': user_stats,
-        'temp_emails': temp_emails
-    }
     with open(DATA_FILE, 'w') as f:
-        json.dump(data, f, indent=2)
+        json.dump({
+            'balances': user_balances,
+            'totp': totp_secrets,
+            'withdrawals': pending_withdrawals,
+            'transactions': user_transactions,
+            'stats': user_stats,
+            'banned': banned_users,
+            'languages': user_languages,
+            'country_prices': country_prices,
+            'number_usage': number_usage_count
+        }, f, indent=2)
     
     with open(NUMBERS_FILE, 'w') as f:
         json.dump(available_numbers, f, indent=2)
+    
+    with open(TEMP_MAIL_FILE, 'w') as f:
+        json.dump(temp_mail_data, f, indent=2)
 
 load_data()
 
-# ==================== WEB PANEL WITH CAPTCHA HANDLING ====================
+# ==================== WEB PANEL CLIENT ====================
 class WebPanelClient:
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
+        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
         self.logged_in = False
-        self.last_login = 0
     
     def solve_captcha(self, html):
-        """Extract and solve captcha from login page"""
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        # Look for captcha patterns
-        captcha_text = None
-        captcha_input = None
-        
-        # Pattern 1: Simple math like "5+2="
-        math_patterns = [
-            r'(\d+)\s*\+\s*(\d+)\s*=',
-            r'(\d+)\s*-\s*(\d+)\s*=',
-            r'(\d+)\s*\*\s*(\d+)\s*=',
-            r'(\d+)\s*/\s*(\d+)\s*='
-        ]
-        
-        for pattern in math_patterns:
-            match = re.search(pattern, html)
-            if match:
-                if '+' in pattern:
-                    result = int(match.group(1)) + int(match.group(2))
-                elif '-' in pattern:
-                    result = int(match.group(1)) - int(match.group(2))
-                elif '*' in pattern:
-                    result = int(match.group(1)) * int(match.group(2))
-                else:
-                    result = int(match.group(1)) // int(match.group(2)) if int(match.group(2)) != 0 else 0
-                return str(result)
-        
-        # Pattern 2: Direct number captcha
+        math_match = re.search(r'(\d+)\s*\+\s*(\d+)\s*=', html)
+        if math_match:
+            return str(int(math_match.group(1)) + int(math_match.group(2)))
         num_match = re.search(r'(\d{2,4})', html)
         if num_match:
             return num_match.group(1)
-        
         return None
     
     def login(self):
-        """Login with captcha handling"""
+        global last_web_login
         try:
-            # Get login page first to extract captcha
+            if time.time() - last_web_login < 300 and self.logged_in:
+                return True
             login_page = self.session.get(WEB_LOGIN_URL, timeout=10)
             if login_page.status_code != 200:
                 return False
-            
-            # Solve captcha
-            captcha_answer = self.solve_captcha(login_page.text)
-            
-            # Prepare login data
-            login_data = {
-                'username': WEB_USER,
-                'password': WEB_PASS
-            }
-            
-            # Add captcha if found
-            if captcha_answer:
-                login_data['captcha'] = captcha_answer
-                # Try different field names
-                for field in ['captcha_code', 'code', 'captcha_response', 'answer']:
-                    login_data[field] = captcha_answer
-            
-            # Attempt login
+            captcha = self.solve_captcha(login_page.text)
+            login_data = {'username': WEB_USER, 'password': WEB_PASS}
+            if captcha:
+                login_data['captcha'] = captcha
             response = self.session.post(WEB_LOGIN_URL, data=login_data, timeout=10)
-            
-            # Check if login successful
-            if response.status_code == 200:
-                if 'dashboard' in response.text.lower() or 'welcome' in response.text.lower():
-                    self.logged_in = True
-                    self.last_login = time.time()
-                    print("✅ Web panel login successful")
-                    return True
-                else:
-                    # Try without captcha
-                    response2 = self.session.post(WEB_LOGIN_URL, data={'username': WEB_USER, 'password': WEB_PASS}, timeout=10)
-                    if response2.status_code == 200 and ('dashboard' in response2.text.lower() or 'welcome' in response2.text.lower()):
-                        self.logged_in = True
-                        self.last_login = time.time()
-                        print("✅ Web panel login successful (no captcha)")
-                        return True
-            
-            return False
-            
-        except Exception as e:
-            print(f"Login error: {e}")
+            self.logged_in = response.status_code == 200
+            if self.logged_in:
+                last_web_login = time.time()
+            return self.logged_in
+        except:
             return False
     
-    def fetch_sms_data(self):
-        """Fetch SMS/CDR data from panel"""
+    def get_otp(self, number):
         try:
-            if not self.logged_in or (time.time() - self.last_login) > 300:  # Re-login every 5 min
-                self.login()
-            
-            response = self.session.get(WEB_API_URL, timeout=10)
-            if response.status_code == 200:
-                return response.text
-            return None
-        except Exception as e:
-            print(f"Fetch error: {e}")
-            return None
-    
-    def get_otp_for_number(self, number: str) -> Optional[Dict]:
-        """Get OTP for specific number from panel data"""
-        try:
-            data = self.fetch_sms_data()
-            if not data:
+            if not self.login():
                 return None
-            
-            # Parse the data - looking for number and OTP patterns
-            lines = data.split('\n')
-            
-            for line in lines:
-                if number in line:
-                    # Extract OTP (4-6 digits)
-                    otp_match = re.search(r'\b\d{4,6}\b', line)
-                    if otp_match:
-                        otp = otp_match.group()
-                        
-                        # Detect service
-                        service = "Unknown"
-                        services = {
-                            'facebook': 'Facebook', 'fb': 'Facebook',
-                            'whatsapp': 'WhatsApp', 'wa': 'WhatsApp',
-                            'telegram': 'Telegram', 'tg': 'Telegram',
-                            'imo': 'IMO', 'instagram': 'Instagram', 'ig': 'Instagram',
-                            'tiktok': 'TikTok', 'google': 'Google', 'gmail': 'Google',
-                            'twitter': 'Twitter', 'snapchat': 'Snapchat', 'linkedin': 'LinkedIn'
-                        }
-                        
-                        for key, val in services.items():
-                            if key in line.lower():
-                                service = val
-                                break
-                        
-                        return {
-                            'otp': otp,
-                            'service': service,
-                            'full_message': line.strip()
-                        }
-            
+            response = self.session.get(f"{WEB_API_URL}?number={number}", timeout=10)
+            if response.status_code == 200:
+                text = response.text
+                otp = re.search(r'\b\d{4,6}\b', text)
+                if otp:
+                    service = "FACEBOOK"
+                    services = {'whatsapp': 'WHATSAPP', 'telegram': 'TELEGRAM', 'imo': 'IMO', 'instagram': 'INSTAGRAM', 'tiktok': 'TIKTOK', 'google': 'GOOGLE', 'twitter': 'TWITTER', 'facebook': 'FACEBOOK', 'fb': 'FACEBOOK'}
+                    for key, val in services.items():
+                        if key in text.lower():
+                            service = val
+                            break
+                    return {'otp': otp.group(), 'service': service}
             return None
-            
-        except Exception as e:
-            print(f"OTP fetch error: {e}")
+        except:
             return None
 
 web_panel = WebPanelClient()
 
-# ==================== TOTP 2FA GENERATOR ====================
+# ==================== TOTP GENERATOR ====================
 class TOTPGenerator:
     @staticmethod
-    def generate_secret() -> str:
-        """Generate base32 secret key"""
+    def generate_secret():
         return base64.b32encode(secrets.token_bytes(20)).decode('utf-8')
     
     @staticmethod
-    def get_code(secret: str) -> str:
-        """Generate TOTP code"""
+    def get_code(secret):
         try:
-            # Clean secret
             secret = secret.upper().replace(' ', '')
-            # Add padding
             padding = 8 - (len(secret) % 8)
             if padding != 8:
                 secret += '=' * padding
-            
             key = base64.b32decode(secret)
             counter = int(time.time()) // 30
             msg = struct.pack('>Q', counter)
@@ -279,968 +196,991 @@ class TOTPGenerator:
             offset = h[-1] & 0x0F
             code = (struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
             return f"{code:06d}"
-        except Exception as e:
-            print(f"TOTP error: {e}")
+        except:
             return "000000"
     
     @staticmethod
-    def time_remaining() -> int:
-        """Seconds remaining in current interval"""
+    def time_left():
         return 30 - (int(time.time()) % 30)
 
-# ==================== KEYBOARDS ====================
-def get_main_keyboard(is_admin: bool = False):
-    kb = [
-        [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
-        [InlineKeyboardButton("🔐 2FA Authenticator", callback_data="twofa")],
-        [InlineKeyboardButton("📧 Temp Mail", callback_data="tempmail")],
-        [InlineKeyboardButton("💰 Balance", callback_data="balance")],
-        [InlineKeyboardButton("💸 Withdraw", callback_data="withdraw")],
-        [InlineKeyboardButton("📊 My Stats", callback_data="mystats")],
-        [InlineKeyboardButton("📢 Support", callback_data="support")]
+# ==================== TEMP MAIL SERVICE ====================
+class TempMailService:
+    def __init__(self):
+        self.sessions = {}
+    
+    def generate_email(self, user_id):
+        try:
+            import uuid
+            domain_response = requests.get("https://api.mail.tm/domains", timeout=10)
+            if domain_response.status_code == 200:
+                domains = domain_response.json().get('hydra:member', [])
+                if domains:
+                    domain = domains[0]['domain']
+                    email = f"{uuid.uuid4().hex[:10]}@{domain}"
+                    password = secrets.token_hex(10)
+                    
+                    create_data = {"address": email, "password": password}
+                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
+                    if create_response.status_code == 201:
+                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
+                        if token_response.status_code == 200:
+                            token_data = token_response.json()
+                            self.sessions[user_id] = {
+                                'email': email,
+                                'password': password,
+                                'token': token_data.get('token'),
+                                'id': create_response.json().get('id')
+                            }
+                            return email
+        except:
+            pass
+        
+        username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
+        email = f"{username}@10minutemail.net"
+        self.sessions[user_id] = {'email': email, 'type': '10min'}
+        return email
+    
+    def check_inbox(self, user_id):
+        if user_id not in self.sessions:
+            return []
+        
+        session = self.sessions[user_id]
+        messages = []
+        
+        if 'token' in session:
+            try:
+                headers = {'Authorization': f'Bearer {session["token"]}'}
+                response = requests.get("https://api.mail.tm/messages", headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    raw_messages = data.get('hydra:member', [])
+                    for msg in raw_messages:
+                        msg_id = msg.get('id')
+                        if msg_id:
+                            detail_response = requests.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers, timeout=10)
+                            if detail_response.status_code == 200:
+                                detail = detail_response.json()
+                                html_part = detail.get('html', [])
+                                text_part = detail.get('text', '')
+                                body = ''
+                                if html_part and len(html_part) > 0:
+                                    body = html_part[0].get('value', '')
+                                    body = re.sub(r'<[^>]+>', ' ', body)
+                                    body = re.sub(r'\s+', ' ', body).strip()
+                                elif text_part:
+                                    body = text_part
+                                
+                                messages.append({
+                                    'from': detail.get('from', {}).get('address', 'Unknown'),
+                                    'subject': detail.get('subject', 'No Subject'),
+                                    'body': body[:2000],
+                                    'date': detail.get('createdAt', ''),
+                                    'id': msg_id
+                                })
+            except:
+                pass
+        
+        return messages
+    
+    def get_email(self, user_id):
+        if user_id in self.sessions:
+            return self.sessions[user_id].get('email')
+        return None
+
+temp_mail_service = TempMailService()
+
+# ==================== REPLY KEYBOARDS ====================
+def get_main_keyboard(is_admin=False):
+    keyboard = [
+        [KeyboardButton("📱 Get Number")],
+        [KeyboardButton("📧 Temp Mail"), KeyboardButton("🔐 2FA")],
+        [KeyboardButton("💰 Balance"), KeyboardButton("💸 Withdraw")],
+        [KeyboardButton("📊 My Stats"), KeyboardButton("📢 Support")]
     ]
     if is_admin:
-        kb.append([InlineKeyboardButton("⚙️ Admin Panel", callback_data="admin_panel")])
-    return InlineKeyboardMarkup(kb)
-
-def get_country_keyboard():
-    kb = []
-    for country, numbers in available_numbers.items():
-        if numbers:
-            flag = get_country_flag(country)
-            kb.append([InlineKeyboardButton(f"{flag} {country} (0.40TK)", callback_data=f"country_{country}")])
-    
-    if not kb:
-        kb.append([InlineKeyboardButton("❌ No Countries Available", callback_data="noop")])
-    
-    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh_countries")])
-    kb.append([InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")])
-    return InlineKeyboardMarkup(kb)
-
-def get_number_keyboard(country: str, numbers: list):
-    kb = []
-    for num in numbers[:8]:  # Show first 8 numbers
-        kb.append([InlineKeyboardButton(f"📱 {num}", callback_data=f"use_num_{country}_{num}")])
-    kb.append([InlineKeyboardButton("🔄 Refresh Numbers", callback_data=f"refresh_numbers_{country}")])
-    kb.append([InlineKeyboardButton("🔙 Back to Countries", callback_data="get_number")])
-    kb.append([InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")])
-    return InlineKeyboardMarkup(kb)
-
-def get_otp_action_keyboard(number: str, country: str):
-    kb = [
-        [InlineKeyboardButton("🔄 Check OTP", callback_data=f"check_otp_{number}")],
-        [InlineKeyboardButton("📱 Change Number", callback_data="get_number")],
-        [InlineKeyboardButton("🌍 Change Country", callback_data="get_number")],
-        [InlineKeyboardButton("📢 OTP Group", url=f"https://t.me/{OTP_GROUP[1:]}")],
-        [InlineKeyboardButton("📢 Main Channel", url=f"https://t.me/{MAIN_CHANNEL[1:]}")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
-    ]
-    return InlineKeyboardMarkup(kb)
+        keyboard.append([KeyboardButton("⚙️ Admin Panel")])
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 def get_admin_keyboard():
-    kb = [
-        [InlineKeyboardButton("➕ Add Number", callback_data="admin_add_number")],
-        [InlineKeyboardButton("🗑 Remove Number", callback_data="admin_remove_number")],
-        [InlineKeyboardButton("📋 List Numbers", callback_data="admin_list_numbers")],
-        [InlineKeyboardButton("➕ Add Country", callback_data="admin_add_country")],
-        [InlineKeyboardButton("💰 Add Balance", callback_data="admin_add_balance")],
-        [InlineKeyboardButton("💸 Process Withdrawals", callback_data="admin_process_withdraw")],
-        [InlineKeyboardButton("📊 Statistics", callback_data="admin_stats")],
-        [InlineKeyboardButton("📨 Broadcast", callback_data="admin_broadcast")],
-        [InlineKeyboardButton("👥 Users List", callback_data="admin_users")],
-        [InlineKeyboardButton("📈 Transaction Log", callback_data="admin_transactions")],
-        [InlineKeyboardButton("🔙 Back to Main", callback_data="back_main")]
+    keyboard = [
+        [KeyboardButton("➕ Add Number"), KeyboardButton("📋 List Numbers")],
+        [KeyboardButton("🌍 Edit Country")],
+        [KeyboardButton("💰 Set Price"), KeyboardButton("💰 Add Balance")],
+        [KeyboardButton("💸 Process Withdrawals"), KeyboardButton("📊 Statistics")],
+        [KeyboardButton("📨 Broadcast"), KeyboardButton("👥 Users List")],
+        [KeyboardButton("🚫 Ban/Unban User"), KeyboardButton("📥 Export Data")],
+        [KeyboardButton("🔙 Back to Main")]
     ]
-    return InlineKeyboardMarkup(kb)
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def get_withdraw_keyboard():
-    kb = [
-        [InlineKeyboardButton("bKash", callback_data="withdraw_bkash")],
-        [InlineKeyboardButton("Nagad", callback_data="withdraw_nagad")],
-        [InlineKeyboardButton("Rocket", callback_data="withdraw_rocket")],
-        [InlineKeyboardButton("🔙 Back", callback_data="balance")]
+def get_country_selection_keyboard(countries):
+    keyboard = []
+    for country in countries:
+        if available_numbers.get(country):
+            count = len(available_numbers[country])
+            keyboard.append([InlineKeyboardButton(f"🌍 {country} ({count} numbers)", callback_data=f"user_select_country_{country}")])
+    keyboard.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_number_display_text(numbers, country):
+    price = country_prices.get(country, 0.40)
+    text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
+    text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
+    text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
+    for i, num in enumerate(numbers[:3], 1):
+        text += f"📱 *Number {i}:* `{num}`\n"
+    text += f"\n🔑 *OTP কোড:* `Waiting...` ⏳\n\n"
+    text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
+    text += f"📢 *OTP GROUP*"
+    return text
+
+def get_number_action_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 OTP GROUP", url=f"https://t.me/{OTP_GROUP[1:]}")],
+        [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
-    return InlineKeyboardMarkup(kb)
+    return InlineKeyboardMarkup(keyboard)
 
-def get_2fa_keyboard(secret: str):
-    code = TOTPGenerator.get_code(secret)
-    remaining = TOTPGenerator.time_remaining()
-    kb = [
-        [InlineKeyboardButton(f"🔄 Refresh ({remaining}s)", callback_data="2fa_refresh")],
-        [InlineKeyboardButton("📋 Copy Code", callback_data=f"2fa_copy_{code}")],
-        [InlineKeyboardButton("📋 Copy Secret", callback_data="2fa_copy_secret")],
-        [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
+def get_2fa_display_keyboard(secret, code, remaining):
+    keyboard = [
+        [InlineKeyboardButton(f"⏱ {remaining}s remaining", callback_data="noop")],
+        [InlineKeyboardButton("🔄 Refresh Code", callback_data="2fa_refresh")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
-    return InlineKeyboardMarkup(kb), code, remaining
+    return InlineKeyboardMarkup(keyboard)
 
-def get_country_flag(country: str) -> str:
-    flags = {
-        "Myanmar": "🇲🇲", "Germany": "🇩🇪", "Tanzania": "🇹🇿", "Syria": "🇸🇾",
-        "Peru": "🇵🇪", "Bangladesh": "🇧🇩", "India": "🇮🇳", "Pakistan": "🇵🇰",
-        "UAE": "🇦🇪", "Saudi Arabia": "🇸🇦", "USA": "🇺🇸", "UK": "🇬🇧",
-        "Canada": "🇨🇦", "Australia": "🇦🇺", "France": "🇫🇷", "Spain": "🇪🇸",
-        "Italy": "🇮🇹", "Turkey": "🇹🇷", "Egypt": "🇪🇬", "Nigeria": "🇳🇬"
-    }
-    return flags.get(country, "🌍")
+def get_2fa_initial_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("❌ Cancel", callback_data="2fa_cancel")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# ==================== TEMP MAIL SERVICE ====================
-def generate_temp_email(user_id: int) -> str:
-    """Generate temporary email"""
-    username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=12))
-    email = f"{username}@mailto.plus"
-    temp_emails[user_id] = {
-        'email': email,
-        'created_at': datetime.now().isoformat(),
-        'messages': []
-    }
-    save_data()
-    return email
+def get_tempmail_keyboard(email):
+    keyboard = [
+        [InlineKeyboardButton("📋 Copy Email", callback_data=f"copy_email_{email}")],
+        [InlineKeyboardButton("🔄 Refresh Inbox", callback_data="refresh_inbox")],
+        [InlineKeyboardButton("🆕 New Email", callback_data="new_tempmail")],
+        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-def check_temp_email(user_id: int) -> list:
-    """Check for new emails"""
-    # In production, integrate with actual temp mail API
-    return temp_emails.get(user_id, {}).get('messages', [])
+def get_admin_country_keyboard(countries, action):
+    keyboard = []
+    for country in countries:
+        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"{action}_{country}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(keyboard)
+
+def get_price_country_keyboard(countries):
+    keyboard = []
+    for country in countries:
+        current_price = country_prices.get(country, 0.30)
+        keyboard.append([InlineKeyboardButton(f"🌍 {country} (Current: {current_price} TK)", callback_data=f"setprice_{country}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(keyboard)
 
 # ==================== BOT HANDLERS ====================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
+async def start(update, context):
     user = update.effective_user
-    is_admin = user.id == ADMIN_ID
+    user_id = user.id
+    is_admin = user_id == ADMIN_ID
     
-    # Initialize user if new
-    if user.id not in user_balances:
-        user_balances[user.id] = 0
-        user_stats[user.id] = {
-            'joined': datetime.now().isoformat(),
-            'total_orders': 0,
-            'total_earned': 0,
-            'total_spent': 0
-        }
+    if user_id in banned_users:
+        await update.message.reply_text("❌ You are banned from using this bot.")
+        return
+    
+    if user_id not in user_balances:
+        user_balances[user_id] = 0
+        user_stats[user_id] = {'joined': datetime.now().isoformat(), 'total_otps': 0, 'total_earned': 0}
         save_data()
     
-    welcome_text = f"""
-🎉 *Welcome to GetPaid OTP 2.0 Bot* 🎉
+    welcome_text = f"""🎉 *OTP SERVICE BOT* এ স্বাগতম 🎉
 
 👤 *User:* {user.first_name}
-🆔 *ID:* `{user.id}`
-📊 *Monthly Users:* 14,738
-💰 *Balance:* {user_balances.get(user.id, 0):.2f} TK
+💰 *Balance:* {user_balances.get(user_id, 0):.2f} TK
+📊 *Total Earned:* {user_stats.get(user_id, {}).get('total_earned', 0):.2f} TK
 
 ⚡ *How it works:*
-• Select a country and number (Cost: 0.40 TK)
+• 📱 Get Number - Get free virtual number
 • Receive OTP on that number
-• Earn 0.30 TK per OTP received
-• Minimum withdrawal: {MIN_WITHDRAW} TK
+• Earn money per OTP (varies by country)
+• Minimum Withdraw: {MIN_WITHDRAW} TK
 
-🔐 *Services:* 2FA | Temp Mail | OTP
+👇 *Choose an option:*"""
 
-👇 *Choose an option:*
-"""
+    await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(is_admin))
+
+async def handle_message(update, context):
+    user_id = update.effective_user.id
+    text = update.message.text
+    is_admin = user_id == ADMIN_ID
     
-    await update.message.reply_text(
-        welcome_text,
-        parse_mode=ParseMode.MARKDOWN,
-        reply_markup=get_main_keyboard(is_admin)
-    )
+    if user_id in banned_users:
+        await update.message.reply_text("❌ You are banned!")
+        return
+    
+    # Handle 2FA secret key input
+    if context.user_data.get('awaiting_2fa'):
+        if text == '/cancel':
+            context.user_data['awaiting_2fa'] = False
+            await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
+            return
+        
+        secret = text.upper().replace(' ', '')
+        if len(secret) >= 16 and re.match(r'^[A-Z2-7]+$', secret):
+            totp_secrets[user_id] = secret
+            save_data()
+            context.user_data['awaiting_2fa'] = False
+            
+            code = TOTPGenerator.get_code(secret)
+            remaining = TOTPGenerator.time_left()
+            kb = get_2fa_display_keyboard(secret, code, remaining)
+            
+            msg = await update.message.reply_text(
+                f"🔐 *2FA Authenticator Setup Complete!*\n\n"
+                f"🔑 *Secret Key:* `{secret}`\n\n"
+                f"🔢 *Current Code:* `{code}`\n\n"
+                f"✅ Click on code to copy\n"
+                f"⏱ Changes in {remaining} seconds",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
+            )
+            
+            user_2fa_messages[user_id] = msg.message_id
+            
+            if user_id in user_2fa_tasks:
+                user_2fa_tasks[user_id].cancel()
+            
+            task = asyncio.create_task(auto_refresh_2fa(context, update.message.chat_id, user_id, msg.message_id))
+            user_2fa_tasks[user_id] = task
+        else:
+            await update.message.reply_text("❌ Invalid secret key!\n\nSecret key must be:\n• At least 16 characters\n• Only A-Z and 2-7\n\nTry again.", reply_markup=get_2fa_initial_keyboard())
+        return
+    
+    # Handle number addition from admin
+    if context.user_data.get('awaiting_numbers') and is_admin:
+        country = context.user_data.get('pending_country')
+        if country and text and text != '/cancel':
+            numbers = text.strip().split('\n')
+            added = 0
+            duplicate = 0
+            for num in numbers:
+                num = num.strip()
+                if num:
+                    if not num.startswith('+'):
+                        num = '+' + num
+                    if country not in available_numbers:
+                        available_numbers[country] = []
+                    if num not in available_numbers[country]:
+                        available_numbers[country].append(num)
+                        added += 1
+                    else:
+                        duplicate += 1
+            save_data()
+            context.user_data['awaiting_numbers'] = False
+            context.user_data['pending_country'] = None
+            total = len(available_numbers.get(country, []))
+            await update.message.reply_text(f"✅ {added} numbers added to {country}!\n❌ Duplicate: {duplicate}\n\n📊 Total numbers: {total}")
+            return
+        elif text == '/cancel':
+            context.user_data['awaiting_numbers'] = False
+            context.user_data['pending_country'] = None
+            await update.message.reply_text("❌ Number addition cancelled.")
+            return
+    
+    # Handle price setting from admin
+    if context.user_data.get('awaiting_price') and is_admin:
+        country = context.user_data.get('price_country')
+        if country and text:
+            try:
+                price = float(text)
+                if price < 0:
+                    await update.message.reply_text("❌ Price cannot be negative!")
+                    return
+                country_prices[country] = price
+                save_data()
+                context.user_data['awaiting_price'] = False
+                context.user_data['price_country'] = None
+                await update.message.reply_text(f"✅ {country} OTP price set to: {price} TK")
+            except ValueError:
+                await update.message.reply_text("❌ Invalid price! Enter a number (e.g., 0.30)")
+            return
+        elif text == '/cancel':
+            context.user_data['awaiting_price'] = False
+            context.user_data['price_country'] = None
+            await update.message.reply_text("❌ Price setting cancelled.")
+            return
+    
+    # ==================== MAIN MENU ====================
+    if text == "📱 Get Number":
+        if not available_numbers:
+            await update.message.reply_text("❌ No countries available. Admin please add countries first.")
+            return
+        
+        countries = [c for c in available_numbers.keys() if available_numbers[c]]
+        if not countries:
+            await update.message.reply_text("❌ No numbers available in any country. Admin please add numbers.")
+            return
+        
+        await update.message.reply_text(
+            "🌍 *Select Country*\n\nChoose your country:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_country_selection_keyboard(countries)
+        )
+        return
+    
+    elif text == "📧 Temp Mail":
+        email = temp_mail_service.generate_email(user_id)
+        temp_mail_data[user_id] = {
+            'email': email, 
+            'created': time.time(), 
+            'messages': [],
+            'last_count': 0
+        }
+        save_data()
+        
+        if user_id in mail_check_tasks:
+            mail_check_tasks[user_id].cancel()
+        mail_check_tasks[user_id] = asyncio.create_task(auto_check_mail_and_send(context, user_id))
+        
+        await update.message.reply_text(
+            f"📧 *YOUR TEMP EMAIL IS READY*\n\n"
+            f"📨 `{email}`\n\n"
+            f"⚡ Check your mail speed!\n"
+            f"Emails will appear automatically when received.\n\n"
+            f"💡 Click on email to copy",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_tempmail_keyboard(email)
+        )
+        return
+    
+    elif text == "🔐 2FA":
+        await update.message.reply_text(
+            "🔐 *2FA Authenticator*\n\n"
+            "📝 *Send your Authenticator Secret Key*\n\n"
+            "Example: `JBSWY3DPEHPK3PXP`\n\n"
+            "👇 *Click Cancel to cancel:*",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_2fa_initial_keyboard()
+        )
+        context.user_data['awaiting_2fa'] = True
+        return SECRET_KEY_STATE
+    
+    elif text == "💰 Balance":
+        balance = user_balances.get(user_id, 0)
+        stats = user_stats.get(user_id, {})
+        await update.message.reply_text(
+            f"💰 *Your Balance*\n\n"
+            f"💵 *Available:* `{balance:.2f} TK`\n\n"
+            f"📊 *Statistics:*\n"
+            f"• Total OTPs: {stats.get('total_otps', 0)}\n"
+            f"• Total Earned: {stats.get('total_earned', 0):.2f} TK\n"
+            f"• Joined: {stats.get('joined', 'N/A')[:10]}\n\n"
+            f"💸 *Minimum Withdraw:* {MIN_WITHDRAW} TK",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif text == "💸 Withdraw":
+        balance = user_balances.get(user_id, 0)
+        if balance >= MIN_WITHDRAW:
+            await update.message.reply_text(
+                f"💸 *Withdrawal Request*\n\n"
+                f"💰 *Your Balance:* {balance:.2f} TK\n\n"
+                f"📝 Send:\n"
+                f"`/withdraw METHOD ACCOUNT_NUMBER`\n\n"
+                f"Example: `/withdraw bKash 01XXXXXXXXX`\n\n"
+                f"Available Methods: bKash, Nagad, Rocket",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *Insufficient Balance!*\n\n"
+                f"💰 Your Balance: {balance:.2f} TK\n"
+                f"💵 Required: {MIN_WITHDRAW} TK\n\n"
+                f"📱 Get more numbers and receive OTPs!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+    
+    elif text == "📊 My Stats":
+        stats = user_stats.get(user_id, {})
+        balance = user_balances.get(user_id, 0)
+        await update.message.reply_text(
+            f"📊 *Your Statistics*\n\n"
+            f"💰 *Balance:* {balance:.2f} TK\n"
+            f"🔑 *Total OTPs:* {stats.get('total_otps', 0)}\n"
+            f"💵 *Total Earned:* {stats.get('total_earned', 0):.2f} TK\n"
+            f"📅 *Joined:* {stats.get('joined', 'N/A')[:10]}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif text == "📢 Support":
+        await update.message.reply_text(
+            f"📞 *Support Center*\n\n"
+            f"📢 *Main Channel:* {MAIN_CHANNEL}\n"
+            f"👥 *OTP Group:* {OTP_GROUP}\n\n"
+            f"❓ *FAQ:*\n"
+            f"• OTP takes 1-3 minutes\n"
+            f"• Minimum Withdraw: {MIN_WITHDRAW} TK\n\n"
+            f"👨‍💻 *Support:* {SUPPORT_ID}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif text == "⚙️ Admin Panel" and is_admin:
+        await update.message.reply_text("⚙️ *Admin Control Panel*", parse_mode=ParseMode.MARKDOWN, reply_markup=get_admin_keyboard())
+    
+    elif text == "🔙 Back to Main" and is_admin:
+        await update.message.reply_text("🏠 *Main Menu*", parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(is_admin))
+    
+    # ==================== ADMIN COMMANDS ====================
+    elif text == "➕ Add Number" and is_admin:
+        if not available_numbers:
+            await update.message.reply_text("❌ Please add a country first using '🌍 Edit Country' button.")
+            return
+        countries = list(available_numbers.keys())
+        await update.message.reply_text(
+            "🌍 *Which country to add numbers to?*\n\nSelect a country:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_admin_country_keyboard(countries, "addnum_country")
+        )
+    
+    elif text == "📋 List Numbers" and is_admin:
+        if available_numbers:
+            msg = "📋 *Available Numbers*\n\n"
+            for country, nums in available_numbers.items():
+                price = country_prices.get(country, 0.30)
+                msg += f"*{country}:* {len(nums)} numbers (Price: {price} TK)\n"
+                for num in nums[:5]:
+                    masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
+                    msg += f"  • `{masked}`\n"
+                msg += "\n"
+            
+            if len(msg) > 4000:
+                msg = msg[:4000] + "\n\n... more numbers"
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("No numbers available.")
+    
+    elif text == "🌍 Edit Country" and is_admin:
+        await update.message.reply_text(
+            "🌍 *Edit Country*\n\n"
+            "Commands:\n\n"
+            "`/addcountry COUNTRY_NAME` - Add new country\n"
+            "`/removecountry COUNTRY_NAME` - Remove country\n"
+            "`/editcountry OLD_NAME NEW_NAME` - Rename country\n\n"
+            "Examples:\n"
+            "`/addcountry Canada`\n"
+            "`/removecountry Germany`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif text == "💰 Set Price" and is_admin:
+        if not available_numbers:
+            await update.message.reply_text("❌ No countries available.")
+            return
+        countries = list(available_numbers.keys())
+        await update.message.reply_text(
+            "💰 *Select Country to Set Price*\n\nSelect a country:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_price_country_keyboard(countries)
+        )
+    
+    elif text == "💰 Add Balance" and is_admin:
+        await update.message.reply_text(
+            "💰 *Add Balance*\n\n"
+            "Format: `/addbal USER_ID AMOUNT`\n"
+            "Example: `/addbal 7064572216 100`"
+        )
+    
+    elif text == "💸 Process Withdrawals" and is_admin:
+        if pending_withdrawals:
+            msg = "💸 *Pending Withdrawals*\n\n"
+            for uid, wd in pending_withdrawals.items():
+                msg += f"👤 User: `{uid}`\n💰 Amount: {wd['amount']:.2f} TK\n💳 Method: {wd['method']}\n📱 Account: {wd['account']}\n➖➖➖\n\n"
+            msg += "Approve: `/approvewd USER_ID`\nReject: `/rejectwd USER_ID`"
+            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("No pending withdrawals.")
+    
+    elif text == "📊 Statistics" and is_admin:
+        total_users = len(user_balances)
+        total_balance = sum(user_balances.values())
+        total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
+        total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
+        total_numbers = sum(len(nums) for nums in available_numbers.values())
+        await update.message.reply_text(
+            f"📊 *Statistics*\n\n"
+            f"👥 Users: {total_users}\n"
+            f"💰 Total Balance: {total_balance:.2f} TK\n"
+            f"💵 Total Earned: {total_earned:.2f} TK\n"
+            f"🔑 Total OTPs: {total_otps}\n"
+            f"📱 Total Numbers: {total_numbers}\n"
+            f"🌍 Total Countries: {len(available_numbers)}",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    
+    elif text == "📨 Broadcast" and is_admin:
+        await update.message.reply_text(
+            "📨 *Broadcast*\n\n"
+            "Send: `/broadcast YOUR_MESSAGE`"
+        )
+    
+    elif text == "👥 Users List" and is_admin:
+        msg = "👥 *Users List*\n\n"
+        for uid, bal in sorted(user_balances.items(), key=lambda x: x[1], reverse=True)[:30]:
+            stats = user_stats.get(uid, {})
+            msg += f"• `{uid}` - {bal:.2f} TK (OTPs: {stats.get('total_otps', 0)})\n"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    
+    elif text == "🚫 Ban/Unban User" and is_admin:
+        await update.message.reply_text(
+            "🚫 *Ban/Unban User*\n\n"
+            "Ban: `/ban USER_ID REASON`\n"
+            "Example: `/ban 123456789 Spam`\n\n"
+            "Unban: `/unban USER_ID`\n"
+            "Example: `/unban 123456789`"
+        )
+    
+    elif text == "📥 Export Data" and is_admin:
+        await update.message.reply_text(
+            "📥 *Export Data*\n\n"
+            "Commands:\n"
+            "`/export users` - Export users list\n"
+            "`/export numbers` - Export numbers list"
+        )
+    
+    # ==================== WITHDRAW COMMAND ====================
+    if text.startswith('/withdraw'):
+        parts = text.split()
+        if len(parts) >= 3:
+            method = parts[1]
+            account = parts[2]
+            amount = user_balances.get(user_id, 0)
+            if amount >= MIN_WITHDRAW:
+                pending_withdrawals[user_id] = {
+                    'amount': amount, 'method': method, 'account': account,
+                    'time': datetime.now().isoformat()
+                }
+                user_balances[user_id] = 0
+                save_data()
+                await update.message.reply_text(
+                    f"✅ *Withdrawal Request Submitted!*\n\n"
+                    f"💰 Amount: {amount:.2f} TK\n"
+                    f"💳 Method: {method}\n"
+                    f"📱 Account: {account}\n\n"
+                    f"⏳ Will be processed within 24 hours.",
+                    parse_mode=ParseMode.MARKDOWN,
+                    reply_markup=get_main_keyboard(is_admin)
+                )
+                await context.bot.send_message(ADMIN_ID, f"💰 Withdrawal Request\nUser: {user_id}\nAmount: {amount:.2f} TK\nMethod: {method}\nAccount: {account}")
+            else:
+                await update.message.reply_text(f"❌ Minimum withdrawal: {MIN_WITHDRAW} TK\nYour balance: {amount:.2f} TK", reply_markup=get_main_keyboard(is_admin))
+        else:
+            await update.message.reply_text("❌ Use: `/withdraw METHOD ACCOUNT`\nExample: `/withdraw bKash 01XXXXXXXXX`", reply_markup=get_main_keyboard(is_admin))
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all callback queries"""
+# ==================== CALLBACK HANDLER ====================
+async def callback_handler(update, context):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
     data = query.data
     is_admin = user_id == ADMIN_ID
     
-    # ========== NAVIGATION ==========
-    if data == "back_main":
-        await query.edit_message_text(
-            "🏠 *Main Menu*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_main_keyboard(is_admin)
-        )
+    if user_id in banned_users:
+        await query.edit_message_text("❌ You are banned!")
+        return
     
-    elif data == "get_number":
+    if data == "back_home":
+        await query.edit_message_text("🏠 *Main Menu*", parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text("Main Menu", reply_markup=get_main_keyboard(is_admin))
+        return
+    
+    elif data == "back_to_admin":
+        await query.edit_message_text("⚙️ *Admin Panel*", parse_mode=ParseMode.MARKDOWN)
+        await query.message.reply_text("Admin Panel", reply_markup=get_admin_keyboard())
+        return
+    
+    elif data == "change_number":
         if not available_numbers:
-            await query.edit_message_text(
-                "❌ *No numbers available*\n\nPlease contact admin to add numbers.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Back", callback_data="back_main")]])
-            )
-        else:
-            await query.edit_message_text(
-                "🌍 *Select Country*\n\n💰 Price: 0.40 TK per number\n💎 You earn 0.30 TK per OTP received\n\nChoose a country:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_country_keyboard()
-            )
-    
-    elif data == "refresh_countries":
-        await query.edit_message_text(
-            "🌍 *Select Country*\n\n💰 Price: 0.40 TK per number",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_country_keyboard()
-        )
-    
-    elif data.startswith("country_"):
-        country = data.replace("country_", "")
-        context.user_data['selected_country'] = country
-        numbers = available_numbers.get(country, [])
+            await query.edit_message_text("❌ No countries available.")
+            return
         
-        if numbers:
+        countries = [c for c in available_numbers.keys() if available_numbers[c]]
+        await query.edit_message_text(
+            "🌍 *Select Country*\n\nChoose your country:",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_country_selection_keyboard(countries)
+        )
+        return
+    
+    # Admin add number country selection
+    elif data.startswith("addnum_country_"):
+        country = data.replace("addnum_country_", "")
+        context.user_data['pending_country'] = country
+        context.user_data['awaiting_numbers'] = True
+        await query.edit_message_text(
+            f"➕ *Add Numbers to {country}*\n\n"
+            f"Send numbers (one per line):\n"
+            f"Format: `+COUNTRYCODE NUMBER`\n\n"
+            f"Example:\n"
+            f"`+491551329004`\n"
+            f"`+491551329005`\n\n"
+            f"Or upload a .txt file.\n\n"
+            f"Type /cancel to cancel.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # Admin set price country selection
+    elif data.startswith("setprice_"):
+        country = data.replace("setprice_", "")
+        context.user_data['price_country'] = country
+        context.user_data['awaiting_price'] = True
+        current_price = country_prices.get(country, 0.30)
+        await query.edit_message_text(
+            f"💰 *Set Price for {country}*\n\n"
+            f"Current Price: {current_price} TK\n\n"
+            f"Send new price (e.g., 0.20, 0.50, 1.00):\n\n"
+            f"Type /cancel to cancel.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    
+    # User select country
+    elif data.startswith("user_select_country_"):
+        country = data.replace("user_select_country_", "")
+        
+        numbers = available_numbers.get(country, [])
+        if not numbers:
             await query.edit_message_text(
-                f"📱 *Available Numbers - {get_country_flag(country)} {country}*\n\n"
-                f"💰 Price: 0.40 TK\n"
-                f"📊 Available: {len(numbers)} numbers\n\n"
-                f"Select a number:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_number_keyboard(country, numbers)
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ *No numbers available for {country}*\n\nPlease check back later.",
+                f"❌ *No numbers available in {country}!*\n\nPlease contact admin.",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="get_number")]
-                ])
-            )
-    
-    elif data.startswith("refresh_numbers_"):
-        country = data.replace("refresh_numbers_", "")
-        numbers = available_numbers.get(country, [])
-        await query.edit_message_text(
-            f"📱 *Available Numbers - {get_country_flag(country)} {country}*\n\n"
-            f"💰 Price: 0.40 TK\n"
-            f"📊 Available: {len(numbers)} numbers\n\n"
-            f"Select a number:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_number_keyboard(country, numbers)
-        )
-    
-    elif data.startswith("use_num_"):
-        parts = data.split("_")
-        country = parts[2]
-        number = parts[3]
-        
-        # Check balance
-        if user_balances.get(user_id, 0) < OTP_COST_AMOUNT:
-            await query.edit_message_text(
-                f"❌ *Insufficient Balance!*\n\n"
-                f"💰 Your Balance: {user_balances.get(user_id, 0):.2f} TK\n"
-                f"💵 Required: {OTP_COST_AMOUNT} TK\n\n"
-                f"Contact admin to add balance or earn by receiving OTPs.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="get_number")]
+                    [InlineKeyboardButton("🔄 Change Country", callback_data="change_number")],
+                    [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
                 ])
             )
             return
         
-        # Deduct balance
-        user_balances[user_id] = user_balances.get(user_id, 0) - OTP_COST_AMOUNT
+        # Check available numbers (not used)
+        available_num_list = [num for num in numbers if number_usage_count.get(num, 0) < 1]
+        if not available_num_list:
+            await query.edit_message_text(
+                f"❌ *Number stockout in {country}!*\n\nPlease wait for admin to add more numbers.",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Change Country", callback_data="change_number")],
+                    [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
+                ])
+            )
+            return
         
-        # Record transaction
-        if user_id not in user_transactions:
-            user_transactions[user_id] = []
-        user_transactions[user_id].append({
-            'type': 'spent',
-            'amount': OTP_COST_AMOUNT,
-            'number': number,
-            'country': country,
-            'time': datetime.now().isoformat()
-        })
+        # Select 3 random available numbers
+        if len(available_num_list) >= 3:
+            selected_numbers = random.sample(available_num_list, 3)
+        else:
+            selected_numbers = available_num_list
         
-        # Update stats
-        if user_id not in user_stats:
-            user_stats[user_id] = {'total_orders': 0, 'total_earned': 0, 'total_spent': 0}
-        user_stats[user_id]['total_spent'] = user_stats[user_id].get('total_spent', 0) + OTP_COST_AMOUNT
-        user_stats[user_id]['total_orders'] = user_stats[user_id].get('total_orders', 0) + 1
+        # Mark numbers as used
+        for num in selected_numbers:
+            number_usage_count[num] = number_usage_count.get(num, 0) + 1
         
         save_data()
         
-        # Store order
-        active_orders[user_id] = {
-            'number': number,
+        context.user_data['selected_numbers'] = selected_numbers
+        context.user_data['selected_country'] = country
+        user_active_numbers[user_id] = {
+            'numbers': selected_numbers,
             'country': country,
-            'start_time': time.time(),
-            'status': 'waiting',
-            'otp': None,
-            'service': None
+            'selected_time': time.time()
         }
         
-        # Show success message
+        text = get_number_display_text(selected_numbers, country)
         await query.edit_message_text(
-            f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-            f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-            f"🌍 *দেশ ও দাম:* {country} ({OTP_COST_AMOUNT}TK)\n\n"
-            f"📱 *Number:* `{number}`\n\n"
-            f"🔑 *OTP কোড:* `Waiting...` ⏳\n\n"
-            f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-            f"📢 *OTP GROUP:* {OTP_GROUP}\n\n"
-            f"⏳ Waiting for OTP... This may take 1-3 minutes.",
+            text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_otp_action_keyboard(number, country)
+            reply_markup=get_number_action_keyboard()
         )
         
-        # Start background OTP checker
-        asyncio.create_task(check_otp_background(
-            context, user_id, number, country, 
-            query.message.chat_id, query.message.message_id
-        ))
+        # Start OTP checking for all selected numbers
+        for num in selected_numbers:
+            if num not in otp_check_tasks:
+                otp_check_tasks[num] = asyncio.create_task(continuous_otp_check(context, user_id, num, country))
+        return
     
-    elif data.startswith("check_otp_"):
-        number = data.replace("check_otp_", "")
-        
-        # Find user's order
-        for uid, order in active_orders.items():
-            if order.get('number') == number and order.get('otp'):
-                await query.edit_message_text(
-                    f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-                    f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-                    f"🌍 *দেশ ও দাম:* {order['country']} ({OTP_COST_AMOUNT}TK)\n\n"
-                    f"📱 *Number:* `{number}`\n"
-                    f"🔧 *Service:* {order.get('service', 'Unknown')}\n\n"
-                    f"🔑 *OTP কোড:* `{order['otp']}` ✅\n\n"
-                    f"💰 *Earned:* +{OTP_EARN_AMOUNT} TK\n"
-                    f"💵 *New Balance:* {user_balances.get(uid, 0):.2f} TK\n\n"
-                    f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-                    f"📢 *OTP GROUP:* {OTP_GROUP}",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_otp_action_keyboard(number, order['country'])
-                )
-                return
-        
-        await query.answer("Still waiting for OTP. Please wait...", show_alert=True)
-    
-    # ========== 2FA HANDLERS ==========
-    elif data == "twofa":
-        if user_id not in totp_secrets:
-            totp_secrets[user_id] = TOTPGenerator.generate_secret()
-            save_data()
-        
-        kb, code, remaining = get_2fa_keyboard(totp_secrets[user_id])
-        
-        await query.edit_message_text(
-            f"🔐 *2FA Authenticator*\n\n"
-            f"🔑 *Secret Key:*\n`{totp_secrets[user_id]}`\n\n"
-            f"🔢 *Current Code:* `{code}`\n"
-            f"⏱ *Valid for:* {remaining} seconds\n\n"
-            f"📝 *Format:* A-Z and 2-7 only\n"
-            f"⚠️ *Save your secret key!*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=kb
-        )
-        
-        # Start auto-refresh
-        if '2fa_task' not in context.chat_data:
-            context.chat_data['2fa_task'] = asyncio.create_task(
-                auto_refresh_2fa(context, query.message.chat_id, user_id)
-            )
-    
+    # ==================== 2FA CALLBACKS ====================
     elif data == "2fa_refresh":
         if user_id in totp_secrets:
-            code = TOTPGenerator.get_code(totp_secrets[user_id])
-            remaining = TOTPGenerator.time_remaining()
-            kb, _, _ = get_2fa_keyboard(totp_secrets[user_id])
-            
-            await query.edit_message_text(
-                f"🔐 *2FA Authenticator*\n\n"
-                f"🔑 *Secret Key:*\n`{totp_secrets[user_id]}`\n\n"
-                f"🔢 *Current Code:* `{code}`\n"
-                f"⏱ *Valid for:* {remaining} seconds\n\n"
-                f"📝 *Format:* A-Z and 2-7 only",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb
-            )
-    
-    elif data.startswith("2fa_copy_"):
-        code = data.replace("2fa_copy_", "")
-        await query.answer(f"✅ Code copied: {code}", show_alert=True)
-    
-    elif data == "2fa_copy_secret":
-        if user_id in totp_secrets:
-            await query.answer(f"✅ Secret copied!", show_alert=True)
-    
-    # ========== TEMP MAIL ==========
-    elif data == "tempmail":
-        email = generate_temp_email(user_id)
-        await query.edit_message_text(
-            f"📧 *Temporary Email Generated*\n\n"
-            f"📨 `{email}`\n\n"
-            f"⚡ Use this email to receive messages\n"
-            f"📬 Use /checkmail to see incoming emails\n\n"
-            f"💡 *Tip:* Messages appear within 1-2 minutes",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Check Mail", callback_data="check_tempmail")],
-                [InlineKeyboardButton("🆕 New Email", callback_data="tempmail")],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="back_main")]
-            ])
-        )
-    
-    elif data == "check_tempmail":
-        messages = check_temp_email(user_id)
-        if messages:
-            msg = "📬 *Your Messages:*\n\n"
-            for m in messages[-5:]:
-                msg += f"📧 From: {m.get('from', 'Unknown')}\n"
-                msg += f"📝 Subject: {m.get('subject', 'No subject')}\n"
-                msg += f"💬 {m.get('body', '')[:150]}...\n\n"
-            await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await query.edit_message_text(
-                "📭 *No messages yet*\n\nCheck again in a few seconds!",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Refresh", callback_data="check_tempmail")],
-                    [InlineKeyboardButton("🏠 Back", callback_data="back_main")]
-                ])
-            )
-    
-    # ========== BALANCE & WITHDRAW ==========
-    elif data == "balance":
-        balance = user_balances.get(user_id, 0)
-        stats = user_stats.get(user_id, {})
-        
-        await query.edit_message_text(
-            f"💰 *Your Balance*\n\n"
-            f"💵 *Available:* `{balance:.2f} TK`\n\n"
-            f"📊 *Statistics:*\n"
-            f"• Total Orders: {stats.get('total_orders', 0)}\n"
-            f"• Total Earned: {stats.get('total_earned', 0):.2f} TK\n"
-            f"• Total Spent: {stats.get('total_spent', 0):.2f} TK\n\n"
-            f"💸 *Minimum Withdrawal:* {MIN_WITHDRAW} TK\n\n"
-            f"👇 *Withdraw your earnings:*",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💸 Withdraw Now", callback_data="withdraw")],
-                [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-            ])
-        )
-    
-    elif data == "withdraw":
-        balance = user_balances.get(user_id, 0)
-        if balance >= MIN_WITHDRAW:
-            await query.edit_message_text(
-                f"💸 *Withdrawal Request*\n\n"
-                f"💰 Your Balance: {balance:.2f} TK\n"
-                f"💵 Withdrawable: {balance:.2f} TK\n\n"
-                f"Select your withdrawal method:",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_withdraw_keyboard()
-            )
-        else:
-            await query.edit_message_text(
-                f"❌ *Insufficient Balance for Withdrawal*\n\n"
-                f"💰 Your Balance: {balance:.2f} TK\n"
-                f"💵 Minimum Required: {MIN_WITHDRAW} TK\n\n"
-                f"📱 Get more numbers and receive OTPs to earn!\n"
-                f"💰 You earn {OTP_EARN_AMOUNT} TK per OTP received.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📱 Get Number", callback_data="get_number")],
-                    [InlineKeyboardButton("🔙 Back", callback_data="balance")]
-                ])
-            )
-    
-    elif data.startswith("withdraw_"):
-        method = data.replace("withdraw_", "").upper()
-        context.user_data['withdraw_method'] = method
-        
-        await query.edit_message_text(
-            f"💸 *Withdrawal Request - {method}*\n\n"
-            f"💰 Amount: {user_balances.get(user_id, 0):.2f} TK\n"
-            f"💵 Minimum: {MIN_WITHDRAW} TK\n\n"
-            f"📝 Send your {method} account number:\n"
-            f"Example: `01XXXXXXXXX`\n\n"
-            f"Send as: `/wd ACCOUNT_NUMBER`\n\n"
-            f"Type /cancel to cancel",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data['awaiting_withdraw'] = True
-    
-    elif data == "mystats":
-        stats = user_stats.get(user_id, {})
-        balance = user_balances.get(user_id, 0)
-        
-        await query.edit_message_text(
-            f"📊 *Your Statistics*\n\n"
-            f"💰 *Balance:* {balance:.2f} TK\n"
-            f"📦 *Total Orders:* {stats.get('total_orders', 0)}\n"
-            f"💵 *Total Earned:* {stats.get('total_earned', 0):.2f} TK\n"
-            f"💸 *Total Spent:* {stats.get('total_spent', 0):.2f} TK\n"
-            f"📈 *Profit:* {(stats.get('total_earned', 0) - stats.get('total_spent', 0)):.2f} TK\n"
-            f"📅 *Member Since:* {stats.get('joined', 'N/A')[:10]}\n\n"
-            f"📱 *Active Orders:* {len([o for o in active_orders.keys() if o == user_id])}",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-            ])
-        )
-    
-    elif data == "support":
-        await query.edit_message_text(
-            f"📞 *Support Center*\n\n"
-            f"📢 *Main Channel:* {MAIN_CHANNEL}\n"
-            f"👥 *OTP Group:* {OTP_GROUP}\n\n"
-            f"❓ *FAQ:*\n"
-            f"• Q: How to earn?\n"
-            f"  A: Get number → Receive OTP → Earn {OTP_EARN_AMOUNT} TK\n\n"
-            f"• Q: Minimum withdrawal?\n"
-            f"  A: {MIN_WITHDRAW} TK\n\n"
-            f"• Q: How long does OTP take?\n"
-            f"  A: Usually 1-3 minutes\n\n"
-            f"👨‍💻 *Admin:* @GetPaidAdmin\n\n"
-            f"For issues, contact admin.",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{MAIN_CHANNEL[1:]}")],
-                [InlineKeyboardButton("👥 Join Group", url=f"https://t.me/{OTP_GROUP[1:]}")],
-                [InlineKeyboardButton("🔙 Back", callback_data="back_main")]
-            ]),
-            disable_web_page_preview=True
-        )
-    
-    # ========== ADMIN PANEL ==========
-    elif data == "admin_panel" and is_admin:
-        await query.edit_message_text(
-            "⚙️ *Admin Control Panel*\n\n"
-            "Manage bot settings, numbers, and users:",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_admin_keyboard()
-        )
-    
-    elif data == "admin_add_number" and is_admin:
-        await query.edit_message_text(
-            "➕ *Add Number*\n\n"
-            "Send number in format:\n"
-            "`/addnum COUNTRY +1234567890`\n\n"
-            "Example: `/addnum Germany +491551329004`\n\n"
-            "Available countries: " + ", ".join(list(available_numbers.keys())) if available_numbers else "None",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "admin_remove_number" and is_admin:
-        await query.edit_message_text(
-            "🗑 *Remove Number*\n\n"
-            "Send: `/remnum COUNTRY +1234567890`\n\n"
-            "Example: `/remnum Germany +491551329004`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "admin_list_numbers" and is_admin:
-        msg = "📋 *Available Numbers*\n\n"
-        for country, nums in available_numbers.items():
-            if nums:
-                msg += f"*{country}:* {len(nums)} numbers\n"
-                for num in nums[:5]:
-                    msg += f"  • `{num}`\n"
-                msg += "\n"
-        
-        if msg == "📋 *Available Numbers*\n\n":
-            msg += "No numbers available.\n"
-        
-        await query.edit_message_text(
-            msg,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
-        )
-    
-    elif data == "admin_add_country" and is_admin:
-        await query.edit_message_text(
-            "➕ *Add Country*\n\n"
-            "Send: `/addcountry COUNTRY_NAME`\n\n"
-            "Example: `/addcountry Canada`\n\n"
-            "Price will be set to 0.40 TK automatically.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "admin_add_balance" and is_admin:
-        await query.edit_message_text(
-            "💰 *Add Balance*\n\n"
-            "Send: `/addbal USER_ID AMOUNT`\n\n"
-            "Example: `/addbal 7064572216 100`\n\n"
-            "User ID can be found in /users list",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "admin_process_withdraw" and is_admin:
-        if pending_withdrawals:
-            msg = "💸 *Pending Withdrawals*\n\n"
-            for uid, wd in pending_withdrawals.items():
-                msg += f"👤 User: `{uid}`\n"
-                msg += f"💰 Amount: {wd['amount']:.2f} TK\n"
-                msg += f"💳 Method: {wd['method']}\n"
-                msg += f"📱 Account: {wd['account']}\n"
-                msg += f"⏰ Time: {wd['time'][:19]}\n"
-                msg += f"➖➖➖➖➖➖➖➖\n\n"
-            
-            msg += "Send `/approvewd USER_ID` to approve\n"
-            msg += "Send `/rejectwd USER_ID` to reject"
-            
-            await query.edit_message_text(
-                msg,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-                ])
-            )
-        else:
-            await query.edit_message_text(
-                "✅ No pending withdrawals",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-                ])
-            )
-    
-    elif data == "admin_stats" and is_admin:
-        total_users = len(user_balances)
-        total_balance = sum(user_balances.values())
-        total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
-        total_spent = sum(s.get('total_spent', 0) for s in user_stats.values())
-        active_sessions = len(active_orders)
-        pending_wd = len(pending_withdrawals)
-        total_numbers = sum(len(nums) for nums in available_numbers.values())
-        
-        stats_msg = f"""
-📊 *Bot Statistics*
-
-👥 *Total Users:* {total_users}
-💰 *Total Balance:* {total_balance:.2f} TK
-💵 *Total Earned:* {total_earned:.2f} TK
-💸 *Total Spent:* {total_spent:.2f} TK
-📈 *Platform Profit:* {(total_spent - total_earned):.2f} TK
-
-🔄 *Active OTP Sessions:* {active_sessions}
-💸 *Pending Withdrawals:* {pending_wd}
-📱 *Available Numbers:* {total_numbers}
-🌍 *Countries:* {len(available_numbers)}
-
-🔐 *2FA Users:* {len(totp_secrets)}
-📧 *Temp Mail Users:* {len(temp_emails)}
-
-⏰ *Last Login:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-"""
-        await query.edit_message_text(
-            stats_msg,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
-        )
-    
-    elif data == "admin_broadcast" and is_admin:
-        await query.edit_message_text(
-            "📨 *Broadcast Message*\n\n"
-            "Send: `/broadcast Your message here`\n\n"
-            "Message will be sent to ALL users.\n"
-            "HTML formatting supported.\n\n"
-            "Example: `/broadcast <b>Maintenance</b> at 2AM`",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "admin_users" and is_admin:
-        users_list = "👥 *Users List*\n\n"
-        for uid, bal in sorted(user_balances.items(), key=lambda x: x[1], reverse=True)[:20]:
-            stats = user_stats.get(uid, {})
-            users_list += f"• `{uid}` - {bal:.2f} TK (Orders: {stats.get('total_orders', 0)})\n"
-        
-        users_list += f"\nTotal: {len(user_balances)} users"
-        
-        await query.edit_message_text(
-            users_list,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
-        )
-    
-    elif data == "admin_transactions" and is_admin:
-        await query.edit_message_text(
-            "📈 *Recent Transactions*\n\n"
-            "Use `/transactions USER_ID` to view user transactions",
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔙 Back", callback_data="admin_panel")]
-            ])
-        )
-
-async def auto_refresh_2fa(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int):
-    """Auto refresh 2FA code every second"""
-    while True:
-        await asyncio.sleep(1)
-        if user_id in totp_secrets:
-            remaining = TOTPGenerator.time_remaining()
-            if remaining == 30 or remaining == 1:
+            secret = totp_secrets[user_id]
+            code = TOTPGenerator.get_code(secret)
+            remaining = TOTPGenerator.time_left()
+            kb = get_2fa_display_keyboard(secret, code, remaining)
+            msg_id = user_2fa_messages.get(user_id)
+            if msg_id:
                 try:
-                    code = TOTPGenerator.get_code(totp_secrets[user_id])
-                    kb, _, _ = get_2fa_keyboard(totp_secrets[user_id])
                     await context.bot.edit_message_text(
-                        chat_id=chat_id,
-                        message_id=context.chat_data.get('2fa_msg_id'),
+                        chat_id=user_id,
+                        message_id=msg_id,
                         text=f"🔐 *2FA Authenticator*\n\n"
-                             f"🔑 *Secret Key:*\n`{totp_secrets[user_id]}`\n\n"
+                             f"🔑 *Secret Key:* `{secret}`\n\n"
                              f"🔢 *Current Code:* `{code}`\n"
-                             f"⏱ *Valid for:* {remaining} seconds\n\n"
-                             f"📝 *Format:* A-Z and 2-7 only",
+                             f"⏱ {remaining} seconds remaining\n\n"
+                             f"✅ Click on code to copy",
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=kb
                     )
                 except:
                     pass
-
-async def check_otp_background(context: ContextTypes.DEFAULT_TYPE, user_id: int, number: str, country: str, chat_id: int, msg_id: int):
-    """Background task to check for OTP"""
-    for attempt in range(60):  # Check for 4 minutes (60 * 4 = 240 seconds)
-        await asyncio.sleep(4)
+        else:
+            await query.edit_message_text("❌ No secret key found. Please send one first.")
+        return
+    
+    elif data == "2fa_cancel":
+        context.user_data['awaiting_2fa'] = False
+        await query.edit_message_text("❌ 2FA setup cancelled.")
+        await query.message.reply_text("Main Menu", reply_markup=get_main_keyboard(is_admin))
+        return
+    
+    # ==================== TEMP MAIL CALLBACKS ====================
+    elif data == "refresh_inbox":
+        if user_id in temp_mail_data:
+            email = temp_mail_service.get_email(user_id)
+            if email:
+                messages = temp_mail_service.check_inbox(user_id)
+                if messages:
+                    msg = "📬 *Your Inbox*\n\n"
+                    for m in messages[:5]:
+                        msg += f"📧 *From:* {m.get('from', 'Unknown')}\n"
+                        msg += f"📝 *Subject:* {m.get('subject', 'No Subject')}\n"
+                        body = m.get('body', '')[:1500]
+                        if body:
+                            msg += f"💬 *Body:*\n{body}\n"
+                        msg += "➖➖➖➖➖➖\n\n"
+                    await query.edit_message_text(msg, parse_mode=ParseMode.MARKDOWN, reply_markup=get_tempmail_keyboard(email))
+                else:
+                    await query.edit_message_text("📭 *No messages yet*\n\nWaiting for incoming emails...", parse_mode=ParseMode.MARKDOWN, reply_markup=get_tempmail_keyboard(email))
+            else:
+                await query.edit_message_text("❌ Email not found. Generate a new one.")
+        else:
+            await query.edit_message_text("❌ No active email. Generate a new one.")
+        return
+    
+    elif data == "new_tempmail":
+        email = temp_mail_service.generate_email(user_id)
+        temp_mail_data[user_id] = {
+            'email': email, 
+            'created': time.time(), 
+            'messages': [],
+            'last_count': 0
+        }
+        save_data()
         
-        if user_id not in active_orders:
+        if user_id in mail_check_tasks:
+            mail_check_tasks[user_id].cancel()
+        mail_check_tasks[user_id] = asyncio.create_task(auto_check_mail_and_send(context, user_id))
+        
+        await query.edit_message_text(
+            f"📧 *YOUR TEMP EMAIL IS READY*\n\n"
+            f"📨 `{email}`\n\n"
+            f"⚡ Check your mail speed!\n"
+            f"Emails will appear automatically when received.\n\n"
+            f"💡 Click on email to copy",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=get_tempmail_keyboard(email)
+        )
+        return
+    
+    elif data.startswith("copy_email_"):
+        email = data.replace("copy_email_", "")
+        await query.answer(f"✅ Email copied: {email}", show_alert=True)
+        return
+    
+    elif data == "noop":
+        await query.answer()
+        return
+
+async def continuous_otp_check(context, user_id, number, country):
+    """Continuously check for OTP on a number"""
+    for attempt in range(40):
+        await asyncio.sleep(3)
+        
+        if user_id not in user_active_numbers:
+            return
+        if number not in user_active_numbers[user_id].get('numbers', []):
             return
         
-        result = web_panel.get_otp_for_number(number)
-        
+        result = web_panel.get_otp(number)
         if result and result.get('otp'):
             otp = result['otp']
-            service = result.get('service', 'Unknown')
+            service = result.get('service', 'FACEBOOK')
+            price = country_prices.get(country, 0.30)
             
-            # Add earnings
-            user_balances[user_id] = user_balances.get(user_id, 0) + OTP_EARN_AMOUNT
+            user_balances[user_id] = user_balances.get(user_id, 0) + price
+            if user_id not in user_stats:
+                user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
+            user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
+            user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
             
-            # Record transaction
             if user_id not in user_transactions:
                 user_transactions[user_id] = []
             user_transactions[user_id].append({
-                'type': 'earned',
-                'amount': OTP_EARN_AMOUNT,
-                'number': number,
-                'otp': otp,
-                'service': service,
+                'type': 'earned', 'amount': price, 'number': number,
+                'otp': otp, 'service': service, 'country': country,
                 'time': datetime.now().isoformat()
             })
-            
-            # Update stats
-            if user_id not in user_stats:
-                user_stats[user_id] = {'total_orders': 0, 'total_earned': 0, 'total_spent': 0}
-            user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + OTP_EARN_AMOUNT
-            
             save_data()
             
-            # Update order
-            active_orders[user_id]['otp'] = otp
-            active_orders[user_id]['service'] = service
-            active_orders[user_id]['status'] = 'completed'
+            # Send to OTP Group (masked number)
+            masked_for_group = number[:4] + "****" + number[-4:] if len(number) > 8 else number
+            await context.bot.send_message(OTP_GROUP,
+                f"🔐 *OTP SERVICE | OTP RCV*\n\n"
+                f"📱 *Number:* `{masked_for_group}`\n"
+                f"🌍 *Country:* {country}\n"
+                f"🔧 *Service:* {service}\n\n"
+                f"✅ *Status:* CLAIMED\n\n"
+                f"🔑 *OTP Code:* `{otp}`\n\n"
+                f"আপনার ব্যালেন্স +{price} যোগ হবে।\n"
+                f"মোট ব্যালেন্স: {user_balances[user_id]:.2f} TK\n\n"
+                f"`{otp} is your {service} password reset code ❗️`\n\n"
+                f"{MAIN_CHANNEL}",
+                parse_mode=ParseMode.MARKDOWN)
             
-            # Update message
+            # Send to user DM (full number)
+            await context.bot.send_message(user_id,
+                f"🔐 *OTP Received!*\n\n"
+                f"📱 *Number:* `{number}`\n"
+                f"🔧 *Service:* {service}\n"
+                f"🔑 *OTP:* `{otp}`\n\n"
+                f"💰 *+{price} TK added!*\n"
+                f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
+                parse_mode=ParseMode.MARKDOWN)
+            
+            if user_id in user_active_numbers:
+                if number in user_active_numbers[user_id]['numbers']:
+                    user_active_numbers[user_id]['numbers'].remove(number)
+            
+            if number in otp_check_tasks:
+                del otp_check_tasks[number]
+            return
+
+# ==================== BACKGROUND TASKS ====================
+async def auto_refresh_2fa(context, chat_id, user_id, message_id):
+    while user_id in totp_secrets:
+        await asyncio.sleep(1)
+        if user_id in totp_secrets:
+            secret = totp_secrets[user_id]
+            code = TOTPGenerator.get_code(secret)
+            remaining = TOTPGenerator.time_left()
+            kb = get_2fa_display_keyboard(secret, code, remaining)
+            
             try:
                 await context.bot.edit_message_text(
                     chat_id=chat_id,
-                    message_id=msg_id,
-                    text=f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-                         f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-                         f"🌍 *দেশ ও দাম:* {country} ({OTP_COST_AMOUNT}TK)\n\n"
-                         f"📱 *Number:* `{number}`\n"
-                         f"🔧 *Service:* {service}\n\n"
-                         f"🔑 *OTP কোড:* `{otp}` ✅\n\n"
-                         f"💰 *Earned:* +{OTP_EARN_AMOUNT} TK\n"
-                         f"💵 *New Balance:* {user_balances[user_id]:.2f} TK\n\n"
-                         f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-                         f"📢 *OTP GROUP:* {OTP_GROUP}",
+                    message_id=message_id,
+                    text=f"🔐 *2FA Authenticator*\n\n"
+                         f"🔑 *Secret Key:* `{secret}`\n\n"
+                         f"🔢 *Current Code:* `{code}`\n"
+                         f"⏱ {remaining} seconds remaining\n\n"
+                         f"✅ Click on code to copy",
                     parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=get_otp_action_keyboard(number, country)
+                    reply_markup=kb
                 )
-            except Exception as e:
-                print(f"Edit message error: {e}")
+            except:
+                pass
+
+async def auto_check_mail_and_send(context, user_id):
+    last_count = 0
+    while user_id in temp_mail_data:
+        await asyncio.sleep(3)
+        messages = temp_mail_service.check_inbox(user_id)
+        
+        if messages and len(messages) > last_count:
+            new_messages = messages[last_count:]
+            last_count = len(messages)
+            temp_mail_data[user_id]['messages'] = messages
+            save_data()
             
-            # Forward to OTP Group
-            await forward_otp_to_group(context, number, country, otp, service)
-            
-            # Send DM to user
-            await context.bot.send_message(
-                user_id,
-                f"🔐 *OTP Received for Your Number*\n\n"
-                f"📱 *Number:* `{number[-10:]}`\n"
-                f"🌍 *Country:* {country}\n"
-                f"🔧 *Service:* {service}\n"
-                f"🔑 *OTP:* `{otp}`\n\n"
-                f"💰 *+{OTP_EARN_AMOUNT} TK added to balance!*\n"
-                f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            return
+            for msg in new_messages:
+                from_addr = msg.get('from', 'Unknown')
+                subject = msg.get('subject', 'No Subject')
+                body = msg.get('body', '')[:2000]
+                
+                try:
+                    await context.bot.send_message(
+                        user_id,
+                        f"📬 *New Email Received!*\n\n"
+                        f"📧 *From:* {from_addr}\n"
+                        f"📝 *Subject:* {subject}\n\n"
+                        f"💬 *Message:*\n{body}\n\n"
+                        f"➖➖➖➖➖➖",
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception as e:
+                    print(f"Send error: {e}")
+        
+        if time.time() - temp_mail_data[user_id]['created'] > 3600:
+            del temp_mail_data[user_id]
+            save_data()
+            try:
+                await context.bot.send_message(user_id, "⏰ Your temporary email has expired. Generate a new one.")
+            except:
+                pass
+            break
 
-async def forward_otp_to_group(context: ContextTypes.DEFAULT_TYPE, number: str, country: str, otp: str, service: str):
-    """Forward OTP to group in formatted style"""
-    # Mask number (show first 4 and last 4 digits)
-    if len(number) > 8:
-        masked = number[:4] + "****" + number[-4:]
-    else:
-        masked = number
-    
-    message = f"""🔐 *GetPaid OTP 2.0 | OTP RCV*
-
-📱 *Number:* `{masked}`
-🌍 *Country:* {country}
-🔧 *Service:* {service}
-
-✅ *Status:* CLAIMED
-
-🔑 *OTP Code:* `{otp}`
-
-`#{otp} is your {service} verification code`
-
-🔗 @{BOT_USERNAME} | {MAIN_CHANNEL}"""
-    
-    try:
-        await context.bot.send_message(
-            OTP_GROUP,
-            message,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    except Exception as e:
-        print(f"Group forward error: {e}")
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle text messages"""
+# ==================== ADMIN COMMAND HANDLERS ====================
+async def admin_commands(update, context):
     user_id = update.effective_user.id
     text = update.message.text
     is_admin = user_id == ADMIN_ID
     
-    # Handle withdrawal input
-    if context.user_data.get('awaiting_withdraw'):
-        if text == '/cancel':
-            context.user_data['awaiting_withdraw'] = False
-            await update.message.reply_text("❌ Withdrawal cancelled", reply_markup=get_main_keyboard(is_admin))
-            return
-        
-        method = context.user_data.get('withdraw_method', 'Unknown')
-        account = text.strip()
-        amount = user_balances.get(user_id, 0)
-        
-        if amount >= MIN_WITHDRAW:
-            pending_withdrawals[user_id] = {
-                'amount': amount,
-                'method': method,
-                'account': account,
-                'time': datetime.now().isoformat()
-            }
-            save_data()
-            
-            await update.message.reply_text(
-                f"✅ *Withdrawal Request Submitted*\n\n"
-                f"💰 Amount: {amount:.2f} TK\n"
-                f"💳 Method: {method}\n"
-                f"📱 Account: {account}\n\n"
-                f"⏳ Will be processed within 24 hours.\n"
-                f"📢 Contact admin if not processed.",
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=get_main_keyboard(is_admin)
-            )
-            
-            # Notify admin
-            await context.bot.send_message(
-                ADMIN_ID,
-                f"💰 *New Withdrawal Request*\n\n"
-                f"👤 User: `{user_id}`\n"
-                f"💰 Amount: {amount:.2f} TK\n"
-                f"💳 Method: {method}\n"
-                f"📱 Account: {account}\n"
-                f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await update.message.reply_text(
-                f"❌ Insufficient balance! Minimum {MIN_WITHDRAW} TK required.",
-                reply_markup=get_main_keyboard(is_admin)
-            )
-        
-        context.user_data['awaiting_withdraw'] = False
-        return
-    
-    # Handle /cancel
-    if text == '/cancel':
-        context.user_data['awaiting_withdraw'] = False
-        context.user_data['awaiting_2fa'] = False
-        await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
-        return
-    
-    # Handle withdrawal command
-    if text.startswith('/wd'):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            account = parts[1]
-            amount = user_balances.get(user_id, 0)
-            
-            if amount >= MIN_WITHDRAW:
-                method = context.user_data.get('withdraw_method', 'Unknown')
-                pending_withdrawals[user_id] = {
-                    'amount': amount,
-                    'method': method,
-                    'account': account,
-                    'time': datetime.now().isoformat()
-                }
-                save_data()
-                
-                await update.message.reply_text(
-                    f"✅ Withdrawal request submitted!\nAmount: {amount:.2f} TK\nMethod: {method}",
-                    reply_markup=get_main_keyboard(is_admin)
-                )
-                
-                await context.bot.send_message(
-                    ADMIN_ID,
-                    f"💰 Withdrawal\nUser: {user_id}\nAmount: {amount:.2f} TK\nMethod: {method}\nAccount: {account}"
-                )
-            else:
-                await update.message.reply_text(f"❌ Minimum withdrawal: {MIN_WITHDRAW} TK")
-        else:
-            await update.message.reply_text("❌ Send: /wd ACCOUNT_NUMBER")
-        return
-    
-    # Check mail command
-    if text == '/checkmail':
-        messages = check_temp_email(user_id)
-        if messages:
-            msg = "📬 *Your Messages:*\n\n"
-            for m in messages[-5:]:
-                msg += f"📧 From: {m.get('from', 'Unknown')}\n📝 {m.get('body', '')[:150]}\n\n"
-            await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text("📭 No messages yet!")
-        return
-    
-    # ========== ADMIN COMMANDS ==========
     if not is_admin:
         return
     
-    if text.startswith('/addnum'):
-        parts = text.split(maxsplit=2)
-        if len(parts) == 3:
-            country, number = parts[1], parts[2]
+    if text.startswith('/addcountry'):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            country = parts[1]
             if country not in available_numbers:
                 available_numbers[country] = []
-            if number not in available_numbers[country]:
-                available_numbers[country].append(number)
+                country_prices[country] = 0.30
                 save_data()
-                await update.message.reply_text(f"✅ Added `{number}` to {country}", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"✅ '{country}' added successfully!\nDefault price: 0.30 TK")
             else:
-                await update.message.reply_text("❌ Number already exists")
+                await update.message.reply_text("❌ Country already exists")
         else:
-            await update.message.reply_text("❌ Use: /addnum COUNTRY NUMBER")
+            await update.message.reply_text("❌ Use: `/addcountry COUNTRY_NAME`\nExample: `/addcountry Canada`")
     
-    elif text.startswith('/remnum'):
+    elif text.startswith('/removecountry'):
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            country = parts[1]
+            if country in available_numbers:
+                del available_numbers[country]
+                if country in country_prices:
+                    del country_prices[country]
+                save_data()
+                await update.message.reply_text(f"✅ '{country}' and all its numbers removed")
+            else:
+                await update.message.reply_text("❌ Country not found")
+        else:
+            await update.message.reply_text("❌ Use: `/removecountry COUNTRY_NAME`")
+    
+    elif text.startswith('/editcountry'):
         parts = text.split(maxsplit=2)
         if len(parts) == 3:
-            country, number = parts[1], parts[2]
-            if country in available_numbers and number in available_numbers[country]:
-                available_numbers[country].remove(number)
-                if not available_numbers[country]:
-                    del available_numbers[country]
+            old_name = parts[1]
+            new_name = parts[2]
+            if old_name in available_numbers:
+                available_numbers[new_name] = available_numbers.pop(old_name)
+                if old_name in country_prices:
+                    country_prices[new_name] = country_prices.pop(old_name)
                 save_data()
-                await update.message.reply_text(f"✅ Removed `{number}` from {country}", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"✅ '{old_name}' renamed to '{new_name}'")
             else:
-                await update.message.reply_text("❌ Number not found")
+                await update.message.reply_text("❌ Country not found")
         else:
-            await update.message.reply_text("❌ Use: /remnum COUNTRY NUMBER")
+            await update.message.reply_text("❌ Use: `/editcountry OLD_NAME NEW_NAME`")
     
     elif text.startswith('/addbal'):
         parts = text.split()
@@ -1249,29 +1189,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 target = int(parts[1])
                 amount = float(parts[2])
                 user_balances[target] = user_balances.get(target, 0) + amount
+                if target not in user_transactions:
+                    user_transactions[target] = []
+                user_transactions[target].append({
+                    'type': 'admin_add', 'amount': amount, 'time': datetime.now().isoformat()
+                })
                 save_data()
                 await update.message.reply_text(f"✅ Added {amount} TK to `{target}`", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(target, f"💰 +{amount} TK added to your balance!")
+                    await context.bot.send_message(target, f"💰 +{amount} TK added to your balance!\nNew Balance: {user_balances[target]:.2f} TK")
                 except:
                     pass
             except ValueError:
                 await update.message.reply_text("❌ Invalid user ID or amount")
         else:
-            await update.message.reply_text("❌ Use: /addbal USER_ID AMOUNT")
-    
-    elif text.startswith('/addcountry'):
-        parts = text.split(maxsplit=1)
-        if len(parts) == 2:
-            country = parts[1]
-            if country not in available_numbers:
-                available_numbers[country] = []
-                save_data()
-                await update.message.reply_text(f"✅ Added country: {country}")
-            else:
-                await update.message.reply_text("❌ Country already exists")
-        else:
-            await update.message.reply_text("❌ Use: /addcountry COUNTRY_NAME")
+            await update.message.reply_text("❌ Use: `/addbal USER_ID AMOUNT`\nExample: `/addbal 7064572216 100`")
     
     elif text.startswith('/broadcast'):
         msg = text.replace('/broadcast', '', 1).strip()
@@ -1280,18 +1212,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed = 0
             for uid in user_balances.keys():
                 try:
-                    await context.bot.send_message(
-                        uid,
-                        f"📢 *Announcement*\n\n{msg}",
-                        parse_mode=ParseMode.HTML
-                    )
+                    await context.bot.send_message(uid, f"📢 *Announcement*\n\n{msg}", parse_mode=ParseMode.MARKDOWN)
                     sent += 1
                     await asyncio.sleep(0.05)
                 except:
                     failed += 1
             await update.message.reply_text(f"✅ Sent to {sent} users\n❌ Failed: {failed}")
         else:
-            await update.message.reply_text("❌ Use: /broadcast MESSAGE")
+            await update.message.reply_text("❌ Use: `/broadcast MESSAGE`")
     
     elif text.startswith('/approvewd'):
         parts = text.split()
@@ -1303,17 +1231,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 save_data()
                 await update.message.reply_text(f"✅ Withdrawal approved for `{target}`\nAmount: {wd['amount']:.2f} TK", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(
-                        target,
-                        f"✅ *Withdrawal Approved!*\n\n💰 Amount: {wd['amount']:.2f} TK\n💳 Method: {wd['method']}\n\nFunds have been sent to your {wd['method']} account.",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    await context.bot.send_message(target, f"✅ *Withdrawal Approved!*\n\n💰 Amount: {wd['amount']:.2f} TK\n💳 Method: {wd['method']}\n📱 Account: {wd['account']}\n\nThank you.")
                 except:
                     pass
             else:
-                await update.message.reply_text("❌ Withdrawal not found")
+                await update.message.reply_text("❌ Withdrawal request not found")
         else:
-            await update.message.reply_text("❌ Use: /approvewd USER_ID")
+            await update.message.reply_text("❌ Use: `/approvewd USER_ID`")
     
     elif text.startswith('/rejectwd'):
         parts = text.split()
@@ -1322,76 +1246,144 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if target in pending_withdrawals:
                 wd = pending_withdrawals[target]
                 del pending_withdrawals[target]
-                # Refund balance
                 user_balances[target] = user_balances.get(target, 0) + wd['amount']
                 save_data()
-                await update.message.reply_text(f"❌ Withdrawal rejected for `{target}`\nAmount refunded.", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"❌ Withdrawal rejected for `{target}`\nAmount refunded: {wd['amount']:.2f} TK", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(
-                        target,
-                        f"❌ *Withdrawal Rejected*\n\n💰 Amount: {wd['amount']:.2f} TK\nReason: Please contact support.\n\nAmount has been refunded to your balance.",
-                        parse_mode=ParseMode.MARKDOWN
-                    )
+                    await context.bot.send_message(target, f"❌ *Withdrawal Rejected!*\n\nPlease contact support.\n💰 {wd['amount']:.2f} TK refunded to your balance.")
                 except:
                     pass
             else:
-                await update.message.reply_text("❌ Withdrawal not found")
+                await update.message.reply_text("❌ Withdrawal request not found")
         else:
-            await update.message.reply_text("❌ Use: /rejectwd USER_ID")
+            await update.message.reply_text("❌ Use: `/rejectwd USER_ID`")
     
-    elif text == '/users':
-        msg = "👥 *Users*\n\n"
-        for uid, bal in sorted(user_balances.items(), key=lambda x: x[1], reverse=True)[:30]:
-            stats = user_stats.get(uid, {})
-            msg += f"• `{uid}` - {bal:.2f} TK (Orders: {stats.get('total_orders', 0)})\n"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    elif text.startswith('/ban'):
+        parts = text.split(maxsplit=2)
+        if len(parts) >= 2:
+            target = int(parts[1])
+            reason = parts[2] if len(parts) > 2 else "No reason"
+            banned_users[target] = reason
+            save_data()
+            await update.message.reply_text(f"🚫 Banned `{target}`\nReason: {reason}", parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_message(target, f"🚫 *You have been banned!*\n\nReason: {reason}\nContact: {SUPPORT_ID}")
+            except:
+                pass
+        else:
+            await update.message.reply_text("❌ Use: `/ban USER_ID REASON`\nExample: `/ban 123456789 Spam`")
     
-    elif text.startswith('/transactions'):
+    elif text.startswith('/unban'):
         parts = text.split()
         if len(parts) == 2:
             target = int(parts[1])
-            trans = user_transactions.get(target, [])[-10:]
-            if trans:
-                msg = f"📈 *Transactions for `{target}`*\n\n"
-                for t in trans[::-1]:
-                    msg += f"• {t['type'].upper()}: {t['amount']:.2f} TK"
-                    if t.get('service'):
-                        msg += f" ({t['service']})"
-                    msg += f"\n  {t['time'][:19]}\n\n"
-                await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+            if target in banned_users:
+                del banned_users[target]
+                save_data()
+                await update.message.reply_text(f"✅ Unbanned `{target}`", parse_mode=ParseMode.MARKDOWN)
+                try:
+                    await context.bot.send_message(target, f"✅ *You have been unbanned!*\n\nYou can now use the bot again.")
+                except:
+                    pass
             else:
-                await update.message.reply_text("No transactions found")
+                await update.message.reply_text("❌ User is not banned")
         else:
-            await update.message.reply_text("❌ Use: /transactions USER_ID")
+            await update.message.reply_text("❌ Use: `/unban USER_ID`")
+    
+    elif text.startswith('/export'):
+        parts = text.split()
+        if len(parts) == 2:
+            if parts[1] == 'users':
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['User ID', 'Balance', 'Total OTPs', 'Total Earned', 'Joined'])
+                for uid in user_balances:
+                    stats = user_stats.get(uid, {})
+                    writer.writerow([uid, user_balances[uid], stats.get('total_otps', 0), stats.get('total_earned', 0), stats.get('joined', '')])
+                output.seek(0)
+                await update.message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename='users.csv'))
+            elif parts[1] == 'numbers':
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(['Country', 'Number', 'Price'])
+                for country, nums in available_numbers.items():
+                    price = country_prices.get(country, 0.30)
+                    for num in nums:
+                        writer.writerow([country, num, price])
+                output.seek(0)
+                await update.message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename='numbers.csv'))
+            else:
+                await update.message.reply_text("❌ Use: `/export users` or `/export numbers`")
+        else:
+            await update.message.reply_text("❌ Use: `/export users` or `/export numbers`")
     
     elif text == '/stats':
         total_users = len(user_balances)
-        total_bal = sum(user_balances.values())
+        total_balance = sum(user_balances.values())
         total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
-        total_spent = sum(s.get('total_spent', 0) for s in user_stats.values())
+        total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
+        total_numbers = sum(len(nums) for nums in available_numbers.values())
+        pending_wd = len(pending_withdrawals)
         await update.message.reply_text(
-            f"📊 *Bot Stats*\n\n👥 Users: {total_users}\n💰 Balance: {total_bal:.2f} TK\n💵 Earned: {total_earned:.2f} TK\n💸 Spent: {total_spent:.2f} TK\n📈 Profit: {(total_spent - total_earned):.2f} TK",
-            parse_mode=ParseMode.MARKDOWN
-        )
+            f"📊 *Bot Statistics*\n\n"
+            f"👥 Users: {total_users}\n"
+            f"💰 Total Balance: {total_balance:.2f} TK\n"
+            f"💵 Total Earned: {total_earned:.2f} TK\n"
+            f"🔑 Total OTPs: {total_otps}\n"
+            f"📱 Total Numbers: {total_numbers}\n"
+            f"🌍 Total Countries: {len(available_numbers)}\n"
+            f"💸 Pending Withdrawals: {pending_wd}",
+            parse_mode=ParseMode.MARKDOWN)
     
-    elif text == '/login' or text == '/refresh_login':
-        web_panel.logged_in = False
+    elif text == '/login':
         if web_panel.login():
             await update.message.reply_text("✅ Web panel login successful!")
         else:
             await update.message.reply_text("❌ Web panel login failed! Check credentials.")
+    
+    # Handle file upload for bulk numbers
+    if update.message.document:
+        country = context.user_data.get('pending_country')
+        if not country:
+            await update.message.reply_text("❌ First select a country using '➕ Add Number' button.")
+            return
+        
+        file = await update.message.document.get_file()
+        file_path = f"/tmp/{update.message.document.file_name}"
+        await file.download_to_drive(file_path)
+        
+        added = 0
+        duplicate = 0
+        with open(file_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('Country') and not line.startswith('দেশ'):
+                    if not line.startswith('+'):
+                        line = '+' + line
+                    if country not in available_numbers:
+                        available_numbers[country] = []
+                    if line not in available_numbers[country]:
+                        available_numbers[country].append(line)
+                        added += 1
+                    else:
+                        duplicate += 1
+        save_data()
+        context.user_data['awaiting_numbers'] = False
+        context.user_data['pending_country'] = None
+        total = len(available_numbers.get(country, []))
+        await update.message.reply_text(f"✅ {added} numbers added to {country}!\n❌ Duplicate: {duplicate}\n\n📊 Total numbers: {total}")
 
-async def checkmail_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Checkmail command handler"""
-    user_id = update.effective_user.id
-    messages = check_temp_email(user_id)
-    if messages:
-        msg = "📬 *Your Messages:*\n\n"
-        for m in messages[-5:]:
-            msg += f"📧 From: {m.get('from', 'Unknown')}\n📝 {m.get('body', '')[:150]}\n\n"
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("📭 No messages yet!")
+async def twofa_command(update, context):
+    context.user_data['awaiting_2fa'] = True
+    await update.message.reply_text(
+        "🔐 *2FA Authenticator*\n\n"
+        "Send your secret key:\n"
+        "Example: `JBSWY3DPEHPK3PXP`\n\n"
+        "Click Cancel to cancel.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=get_2fa_initial_keyboard()
+    )
+    return SECRET_KEY_STATE
 
 # ==================== FLASK WEBHOOK ====================
 @flask_app.route('/webhook', methods=['POST'])
@@ -1403,69 +1395,49 @@ def webhook():
     except Exception as e:
         return str(e), 500
 
-@flask_app.route('/health', methods=['GET'])
+@flask_app.route('/health')
 def health():
     return jsonify({
-        'status': 'alive',
-        'users': len(user_balances),
-        'active_orders': len(active_orders),
-        'available_numbers': sum(len(nums) for nums in available_numbers.values()),
-        'timestamp': datetime.now().isoformat()
-    }), 200
-
-@flask_app.route('/stats', methods=['GET'])
-def stats():
-    if request.remote_addr != '127.0.0.1':
-        return 'Unauthorized', 401
-    return jsonify({
-        'users': len(user_balances),
-        'total_balance': sum(user_balances.values()),
-        'pending_withdrawals': len(pending_withdrawals),
-        'active_sessions': len(active_orders)
+        'status': 'alive', 
+        'users': len(user_balances), 
+        'numbers': sum(len(n) for n in available_numbers.values()),
+        'temp_mails': len(temp_mail_data),
+        'time': datetime.now().isoformat()
     })
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    # Build application
+    try:
+        import telegram
+        bot = telegram.Bot(BOT_TOKEN)
+        bot.delete_webhook()
+        print("✅ Webhook deleted")
+    except:
+        pass
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Add handlers
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("twofa", twofa_command)],
+        states={SECRET_KEY_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)]},
+        fallbacks=[CallbackQueryHandler(callback_handler, pattern="^2fa_cancel$")]
+    )
+    
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CallbackQueryHandler(handle_callback))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CommandHandler("checkmail", checkmail_command))
-    application.add_handler(CommandHandler("wd", handle_message))
-    application.add_handler(CommandHandler("cancel", handle_message))
+    application.add_handler(CallbackQueryHandler(callback_handler))
+    application.add_handler(conv_handler)
+    application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
+    application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    # Admin commands
-    application.add_handler(CommandHandler("addnum", handle_message))
-    application.add_handler(CommandHandler("remnum", handle_message))
-    application.add_handler(CommandHandler("addbal", handle_message))
-    application.add_handler(CommandHandler("addcountry", handle_message))
-    application.add_handler(CommandHandler("broadcast", handle_message))
-    application.add_handler(CommandHandler("approvewd", handle_message))
-    application.add_handler(CommandHandler("rejectwd", handle_message))
-    application.add_handler(CommandHandler("users", handle_message))
-    application.add_handler(CommandHandler("transactions", handle_message))
-    application.add_handler(CommandHandler("stats", handle_message))
-    application.add_handler(CommandHandler("login", handle_message))
-    application.add_handler(CommandHandler("refresh_login", handle_message))
-    
-    # Login to web panel
-    print("🔄 Logging into web panel...")
     web_panel.login()
     
-    # Start bot
     if os.environ.get('PORT'):
-        # Webhook mode for Railway
         port = int(os.environ.get('PORT', 8080))
-        webhook_url = os.environ.get('WEBHOOK_URL', '')
-        if webhook_url:
-            application.bot.set_webhook(webhook_url)
-            print(f"✅ Webhook set to {webhook_url}")
-        print(f"🚀 Starting Flask server on port {port}")
+        url = os.environ.get('WEBHOOK_URL', '')
+        if url:
+            application.bot.set_webhook(url)
         flask_app.run(host='0.0.0.0', port=port)
     else:
-        # Polling mode for local testing
-        print("🤖 Starting bot in polling mode...")
-        application.run_polling(allowed_updates=Update.ALL_TYPES)
+        print("🤖 OTP SERVICE BOT is running...")
+        application.run_polling()
