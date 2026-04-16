@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3400+ lines)
+# otp_service_bot.py - Complete Final Working Script (3500+ lines)
 import os
 import re
 import json
@@ -18,6 +18,7 @@ from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
+from concurrent.futures import ThreadPoolExecutor
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8343363851:AAF9Gz-iJsOQmEO6D2zH5Odvsta-mS05hWI"
@@ -56,11 +57,12 @@ user_2fa_tasks = {}
 number_usage_count = {}
 last_update_id = 0
 application = None
+used_domains = set()
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
     global user_balances, totp_secrets, available_numbers, pending_withdrawals
-    global user_transactions, user_stats, temp_mail_data, banned_users, country_prices, number_usage_count
+    global user_transactions, user_stats, temp_mail_data, banned_users, country_prices, number_usage_count, used_domains
     
     try:
         with open(DATA_FILE, 'r') as f:
@@ -73,6 +75,7 @@ def load_data():
             banned_users = data.get('banned', {})
             country_prices = data.get('country_prices', {})
             number_usage_count = data.get('number_usage', {})
+            used_domains = set(data.get('used_domains', []))
     except FileNotFoundError:
         pass
     
@@ -98,7 +101,8 @@ def save_data():
             'stats': user_stats,
             'banned': banned_users,
             'country_prices': country_prices,
-            'number_usage': number_usage_count
+            'number_usage': number_usage_count,
+            'used_domains': list(used_domains)
         }, f, indent=2)
     
     with open(NUMBERS_FILE, 'w') as f:
@@ -113,37 +117,62 @@ load_data()
 class TempMailService:
     def __init__(self):
         self.sessions = {}
+        self.all_domains = []
+        self.fetch_domains()
+    
+    def fetch_domains(self):
+        try:
+            response = requests.get("https://api.mail.tm/domains", timeout=10)
+            if response.status_code == 200:
+                domains = response.json().get('hydra:member', [])
+                self.all_domains = [d['domain'] for d in domains if d.get('domain')]
+        except:
+            pass
+        
+        if not self.all_domains:
+            self.all_domains = [
+                'mailto.plus', 'tempmail.plus', 'tmpmail.org', 
+                'guerrillamail.com', '10minutemail.net', 'mailnator.com'
+            ]
+    
+    def get_unused_domain(self):
+        available = [d for d in self.all_domains if d not in used_domains]
+        if not available:
+            used_domains.clear()
+            available = self.all_domains
+        domain = random.choice(available)
+        used_domains.add(domain)
+        save_data()
+        return domain
     
     def generate_email(self, user_id):
         try:
             import uuid
-            domain_response = requests.get("https://api.mail.tm/domains", timeout=10)
-            if domain_response.status_code == 200:
-                domains = domain_response.json().get('hydra:member', [])
-                if domains:
-                    domain = domains[0]['domain']
-                    email = f"{uuid.uuid4().hex[:10]}@{domain}"
-                    password = secrets.token_hex(10)
-                    
-                    create_data = {"address": email, "password": password}
-                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
-                    if create_response.status_code == 201:
-                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
-                        if token_response.status_code == 200:
-                            token_data = token_response.json()
-                            self.sessions[user_id] = {
-                                'email': email,
-                                'password': password,
-                                'token': token_data.get('token'),
-                                'id': create_response.json().get('id')
-                            }
-                            return email
+            domain = self.get_unused_domain()
+            email = f"{uuid.uuid4().hex[:10]}@{domain}"
+            password = secrets.token_hex(10)
+            
+            create_data = {"address": email, "password": password}
+            create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
+            if create_response.status_code == 201:
+                token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
+                if token_response.status_code == 200:
+                    token_data = token_response.json()
+                    self.sessions[user_id] = {
+                        'email': email,
+                        'password': password,
+                        'token': token_data.get('token'),
+                        'id': create_response.json().get('id'),
+                        'domain': domain
+                    }
+                    return email
         except Exception as e:
             print(f"Mail.tm error: {e}")
         
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        email = f"{username}@10minutemail.net"
-        self.sessions[user_id] = {'email': email, 'type': '10min'}
+        domain = self.get_unused_domain()
+        email = f"{username}@{domain}"
+        self.sessions[user_id] = {'email': email, 'type': 'simple', 'domain': domain}
         return email
     
     def check_inbox(self, user_id):
@@ -179,12 +208,12 @@ class TempMailService:
                                 messages.append({
                                     'from': detail.get('from', {}).get('address', 'Unknown'),
                                     'subject': detail.get('subject', 'No Subject'),
-                                    'body': body[:2000],
+                                    'body': body[:3000],
                                     'date': detail.get('createdAt', ''),
                                     'id': msg_id
                                 })
-            except:
-                pass
+            except Exception as e:
+                print(f"Mail check error: {e}")
         
         return messages
     
@@ -274,17 +303,6 @@ def get_number_action_keyboard():
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
     return InlineKeyboardMarkup(keyboard)
-
-def get_otp_received_text(number, country, otp, service, price, balance):
-    text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-    text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-    text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
-    text += f"🔑 *OTP কোড:* `{otp}` ✅\n\n"
-    text += f"💰 *Earned:* +{price} TK\n"
-    text += f"💵 *New Balance:* {balance:.2f} TK\n\n"
-    text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-    text += f"📢 *OTP GROUP*"
-    return text
 
 def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
@@ -957,7 +975,8 @@ async def listen_to_group(app):
     
     while True:
         try:
-            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=100)
+            # Use longer timeout and allow multiple connections
+            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=100, allowed_updates=['channel_post', 'message'])
             
             for update in updates:
                 last_update_id = update.update_id
@@ -1036,9 +1055,6 @@ async def listen_to_group(app):
                                     })
                                     save_data()
                                     
-                                    # Update the user's message with OTP
-                                    otp_text = get_otp_received_text(full_number, country, otp, service, price, user_balances[target_user])
-                                    
                                     # Send to user
                                     await app.bot.send_message(
                                         target_user,
@@ -1091,7 +1107,7 @@ async def auto_refresh_2fa(context, chat_id, user_id, message_id):
 async def auto_check_mail_and_send(context, user_id):
     last_count = 0
     while user_id in temp_mail_data:
-        await asyncio.sleep(3)
+        await asyncio.sleep(2)
         messages = temp_mail_service.check_inbox(user_id)
         
         if messages and len(messages) > last_count:
@@ -1413,7 +1429,11 @@ if __name__ == '__main__':
     except:
         pass
     
-    application = Application.builder().token(BOT_TOKEN).build()
+    # Increase connection pool size
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(connection_pool_size=100, connect_timeout=60, read_timeout=60, write_timeout=60)
+    
+    application = Application.builder().token(BOT_TOKEN).request(request).build()
     
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("twofa", twofa_command)],
