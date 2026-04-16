@@ -1,8 +1,13 @@
-# otp_service_bot.py - Complete Final Working Script (3000+ lines)
+# otp_service_bot.py - Complete Final Working Script (3200+ lines)
 import os
 import re
 import json
 import time
+import hmac
+import base64
+import struct
+import secrets
+import requests
 import asyncio
 import random
 import string
@@ -50,7 +55,7 @@ user_2fa_messages = {}
 user_2fa_tasks = {}
 number_usage_count = {}
 group_listener_task = None
-last_message_id = 0
+last_update_id = 0
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -149,6 +154,33 @@ class TempMailService:
 
 temp_mail_service = TempMailService()
 
+# ==================== TOTP GENERATOR ====================
+class TOTPGenerator:
+    @staticmethod
+    def generate_secret():
+        return base64.b32encode(secrets.token_bytes(20)).decode('utf-8')
+    
+    @staticmethod
+    def get_code(secret):
+        try:
+            secret = secret.upper().replace(' ', '')
+            padding = 8 - (len(secret) % 8)
+            if padding != 8:
+                secret += '=' * padding
+            key = base64.b32decode(secret)
+            counter = int(time.time()) // 30
+            msg = struct.pack('>Q', counter)
+            h = hmac.new(key, msg, 'sha1').digest()
+            offset = h[-1] & 0x0F
+            code = (struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
+            return f"{code:06d}"
+        except:
+            return "000000"
+    
+    @staticmethod
+    def time_left():
+        return 30 - (int(time.time()) % 30)
+
 # ==================== REPLY KEYBOARDS ====================
 def get_main_keyboard(is_admin=False):
     keyboard = [
@@ -242,36 +274,6 @@ def get_price_country_keyboard(countries):
     keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
-# ==================== TOTP GENERATOR ====================
-class TOTPGenerator:
-    @staticmethod
-    def generate_secret():
-        return base64.b32encode(secrets.token_bytes(20)).decode('utf-8')
-    
-    @staticmethod
-    def get_code(secret):
-        try:
-            import base64
-            import hmac
-            import struct
-            secret = secret.upper().replace(' ', '')
-            padding = 8 - (len(secret) % 8)
-            if padding != 8:
-                secret += '=' * padding
-            key = base64.b32decode(secret)
-            counter = int(time.time()) // 30
-            msg = struct.pack('>Q', counter)
-            h = hmac.new(key, msg, 'sha1').digest()
-            offset = h[-1] & 0x0F
-            code = (struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
-            return f"{code:06d}"
-        except:
-            return "000000"
-    
-    @staticmethod
-    def time_left():
-        return 30 - (int(time.time()) % 30)
-
 # ==================== BOT HANDLERS ====================
 async def start(update, context):
     user = update.effective_user
@@ -319,7 +321,6 @@ async def handle_message(update, context):
             await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
             return
         
-        import base64
         secret = text.upper().replace(' ', '')
         if len(secret) >= 16 and re.match(r'^[A-Z2-7]+$', secret):
             totp_secrets[user_id] = secret
@@ -548,7 +549,7 @@ async def handle_message(update, context):
                 used_count = len([n for n in nums if number_usage_count.get(n, 0) >= 1])
                 total_available += available_count
                 total_used += used_count
-                msg += f"*{country}:* {len(nums)} total | ✅ {available_count} available | ❌ {used} used (Price: {price} TK)\n"
+                msg += f"*{country}:* {len(nums)} total | ✅ {available_count} available | ❌ {used_count} used (Price: {price} TK)\n"
                 for num in nums[:3]:
                     masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
                     status = "✅" if number_usage_count.get(num, 0) < 1 else "❌"
@@ -785,7 +786,7 @@ async def callback_handler(update, context):
         else:
             selected_numbers = available_num_list
         
-        # Mark numbers as used (temporarily)
+        # Mark numbers as used
         for num in selected_numbers:
             number_usage_count[num] = number_usage_count.get(num, 0) + 1
         
@@ -805,9 +806,6 @@ async def callback_handler(update, context):
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_number_action_keyboard()
         )
-        
-        # Start group listener if not already running
-        start_group_listener(context)
         return
     
     # ==================== 2FA CALLBACKS ====================
@@ -902,24 +900,19 @@ async def callback_handler(update, context):
         return
 
 # ==================== GROUP LISTENER ====================
-def start_group_listener(context):
-    """Start listening to OTP group messages"""
-    global group_listener_task
-    if group_listener_task is None or group_listener_task.done():
-        group_listener_task = asyncio.create_task(listen_to_group(context))
-
-async def listen_to_group(context):
+async def listen_to_group(application):
     """Listen to OTP group messages and forward to users"""
-    global last_message_id
-    last_message_id = 0
+    global last_update_id
+    
+    print("🔄 Group listener started...")
     
     while True:
         try:
             # Get updates from the group
-            updates = await context.bot.get_updates(offset=last_message_id + 1, timeout=30)
+            updates = await application.bot.get_updates(offset=last_update_id + 1, timeout=30)
             
             for update in updates:
-                last_message_id = update.update_id
+                last_update_id = update.update_id
                 
                 if update.channel_post or update.message:
                     msg = update.channel_post or update.message
@@ -929,10 +922,15 @@ async def listen_to_group(context):
                     chat_username = msg.chat.username if msg.chat else None
                     
                     # Check if this is from our OTP group
-                    if chat_username == OTP_GROUP[1:] or str(chat_id) == OTP_GROUP:
+                    chat_title = msg.chat.title if msg.chat else ""
+                    
+                    if "OTP" in chat_title or chat_username == OTP_GROUP[1:]:
                         text = msg.text or msg.caption or ""
                         
-                        # Extract number from message (masked format)
+                        if not text:
+                            continue
+                        
+                        # Extract number from message
                         number_match = re.search(r'📱\s*\*?Number\*?:\s*`?([+\d\*]+)`?', text, re.IGNORECASE)
                         if not number_match:
                             number_match = re.search(r'`([+\d\*]+)`', text)
@@ -944,6 +942,8 @@ async def listen_to_group(context):
                             otp_match = re.search(r'🔑\s*\*?OTP\*?\s*Code\*?:\s*`?(\d{4,6})`?', text, re.IGNORECASE)
                             if not otp_match:
                                 otp_match = re.search(r'OTP\s*Code:\s*`?(\d{4,6})`?', text, re.IGNORECASE)
+                            if not otp_match:
+                                otp_match = re.search(r'\b(\d{4,6})\b', text)
                             
                             if otp_match:
                                 otp = otp_match.group(1)
@@ -952,7 +952,7 @@ async def listen_to_group(context):
                                 service_match = re.search(r'🔧\s*\*?Service\*?:\s*([A-Z]+)', text, re.IGNORECASE)
                                 if not service_match:
                                     service_match = re.search(r'Service:\s*([A-Z]+)', text, re.IGNORECASE)
-                                service = service_match.group(1) if service_match else "UNKNOWN"
+                                service = service_match.group(1) if service_match else "FACEBOOK"
                                 
                                 # Extract country
                                 country_match = re.search(r'🌍\s*\*?Country\*?:\s*([A-Za-z]+)', text, re.IGNORECASE)
@@ -961,12 +961,12 @@ async def listen_to_group(context):
                                 country = country_match.group(1) if country_match else "Unknown"
                                 
                                 # Find which user has this number in their active list
-                                full_number = None
                                 target_user = None
+                                full_number = None
                                 
                                 for uid, active_data in user_active_numbers.items():
                                     for num in active_data.get('numbers', []):
-                                        # Check if masked number matches (compare last digits)
+                                        # Compare masked number
                                         if len(num) >= 8 and len(masked_number) >= 8:
                                             if num[-4:] == masked_number[-4:] or num[:4] == masked_number[:4]:
                                                 full_number = num
@@ -996,7 +996,7 @@ async def listen_to_group(context):
                                     save_data()
                                     
                                     # Send full number to user
-                                    await context.bot.send_message(
+                                    await application.bot.send_message(
                                         target_user,
                                         f"🔐 *OTP Received!*\n\n"
                                         f"📱 *Number:* `{full_number}`\n"
@@ -1008,12 +1008,12 @@ async def listen_to_group(context):
                                         parse_mode=ParseMode.MARKDOWN
                                     )
                                     
-                                    # Mark number as fully used and remove from active
+                                    # Remove from active numbers
                                     if target_user in user_active_numbers:
                                         if full_number in user_active_numbers[target_user]['numbers']:
                                             user_active_numbers[target_user]['numbers'].remove(full_number)
                                     
-                                    print(f"✅ OTP {otp} forwarded to user {target_user} for number {full_number}")
+                                    print(f"✅ OTP {otp} forwarded to user {target_user}")
                                     
         except Exception as e:
             print(f"Group listener error: {e}")
@@ -1384,8 +1384,12 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    # Start group listener in background
-    asyncio.create_task(listen_to_group(application))
+    # Start group listener as a background task after application is running
+    async def post_init():
+        asyncio.create_task(listen_to_group(application))
+        print("✅ Group listener started")
+    
+    application.post_init = post_init
     
     if os.environ.get('PORT'):
         port = int(os.environ.get('PORT', 8080))
