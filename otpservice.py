@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3200+ lines)
+# otp_service_bot.py - Complete Final Working Script (3400+ lines)
 import os
 import re
 import json
@@ -54,7 +54,6 @@ user_active_numbers = {}
 user_2fa_messages = {}
 user_2fa_tasks = {}
 number_usage_count = {}
-group_listener_task = None
 last_update_id = 0
 application = None
 
@@ -116,37 +115,78 @@ class TempMailService:
         self.sessions = {}
     
     def generate_email(self, user_id):
+        try:
+            import uuid
+            domain_response = requests.get("https://api.mail.tm/domains", timeout=10)
+            if domain_response.status_code == 200:
+                domains = domain_response.json().get('hydra:member', [])
+                if domains:
+                    domain = domains[0]['domain']
+                    email = f"{uuid.uuid4().hex[:10]}@{domain}"
+                    password = secrets.token_hex(10)
+                    
+                    create_data = {"address": email, "password": password}
+                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
+                    if create_response.status_code == 201:
+                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
+                        if token_response.status_code == 200:
+                            token_data = token_response.json()
+                            self.sessions[user_id] = {
+                                'email': email,
+                                'password': password,
+                                'token': token_data.get('token'),
+                                'id': create_response.json().get('id')
+                            }
+                            return email
+        except Exception as e:
+            print(f"Mail.tm error: {e}")
+        
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         email = f"{username}@10minutemail.net"
-        self.sessions[user_id] = {'email': email}
+        self.sessions[user_id] = {'email': email, 'type': '10min'}
         return email
     
     def check_inbox(self, user_id):
         if user_id not in self.sessions:
             return []
         
-        email = self.sessions[user_id].get('email')
-        if not email:
-            return []
+        session = self.sessions[user_id]
+        messages = []
         
-        try:
-            response = requests.get(f"https://api.10minutemail.net/emails/{email}", timeout=5)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get('emails'):
-                    messages = []
-                    for msg in data['emails']:
-                        messages.append({
-                            'from': msg.get('from', 'Unknown'),
-                            'subject': msg.get('subject', 'No Subject'),
-                            'body': msg.get('body', '')[:1000],
-                            'date': msg.get('date', '')
-                        })
-                    return messages
-        except:
-            pass
+        if 'token' in session:
+            try:
+                headers = {'Authorization': f'Bearer {session["token"]}'}
+                response = requests.get("https://api.mail.tm/messages", headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json()
+                    raw_messages = data.get('hydra:member', [])
+                    for msg in raw_messages:
+                        msg_id = msg.get('id')
+                        if msg_id:
+                            detail_response = requests.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers, timeout=10)
+                            if detail_response.status_code == 200:
+                                detail = detail_response.json()
+                                html_part = detail.get('html', [])
+                                text_part = detail.get('text', '')
+                                body = ''
+                                if html_part and len(html_part) > 0:
+                                    body = html_part[0].get('value', '')
+                                    body = re.sub(r'<[^>]+>', ' ', body)
+                                    body = re.sub(r'\s+', ' ', body).strip()
+                                elif text_part:
+                                    body = text_part
+                                
+                                messages.append({
+                                    'from': detail.get('from', {}).get('address', 'Unknown'),
+                                    'subject': detail.get('subject', 'No Subject'),
+                                    'body': body[:2000],
+                                    'date': detail.get('createdAt', ''),
+                                    'id': msg_id
+                                })
+            except:
+                pass
         
-        return []
+        return messages
     
     def get_email(self, user_id):
         if user_id in self.sessions:
@@ -216,13 +256,12 @@ def get_country_selection_keyboard(countries):
     return InlineKeyboardMarkup(keyboard)
 
 def get_number_display_text(numbers, country):
-    price = country_prices.get(country, 0.40)
+    price = country_prices.get(country, 0.30)
     text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
     text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
     text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
     for i, num in enumerate(numbers[:3], 1):
-        masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
-        text += f"📱 *Number {i}:* `{masked}`\n"
+        text += f"📱 *Number {i}:* `{num}`\n"
     text += f"\n🔑 *OTP কোড:* `Waiting...` ⏳\n\n"
     text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
     text += f"📢 *OTP GROUP*"
@@ -235,6 +274,17 @@ def get_number_action_keyboard():
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
     return InlineKeyboardMarkup(keyboard)
+
+def get_otp_received_text(number, country, otp, service, price, balance):
+    text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
+    text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
+    text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
+    text += f"🔑 *OTP কোড:* `{otp}` ✅\n\n"
+    text += f"💰 *Earned:* +{price} TK\n"
+    text += f"💵 *New Balance:* {balance:.2f} TK\n\n"
+    text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
+    text += f"📢 *OTP GROUP*"
+    return text
 
 def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
@@ -552,9 +602,7 @@ async def handle_message(update, context):
                 total_used += used_count
                 msg += f"*{country}:* {len(nums)} total | ✅ {available_count} available | ❌ {used_count} used (Price: {price} TK)\n"
                 for num in nums[:3]:
-                    masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
-                    status = "✅" if number_usage_count.get(num, 0) < 1 else "❌"
-                    msg += f"  {status} `{masked}`\n"
+                    msg += f"  • `{num}`\n"
                 msg += "\n"
             msg += f"\n📊 *Summary:* ✅ {total_available} available | ❌ {total_used} used | 📱 {total_available + total_used} total"
             if len(msg) > 4000:
@@ -781,7 +829,7 @@ async def callback_handler(update, context):
             )
             return
         
-        # Select 3 random available numbers
+        # Select 3 random available numbers (show full number)
         if len(available_num_list) >= 3:
             selected_numbers = random.sample(available_num_list, 3)
         else:
@@ -902,14 +950,14 @@ async def callback_handler(update, context):
 
 # ==================== GROUP LISTENER ====================
 async def listen_to_group(app):
-    """Listen to OTP group messages and forward to users"""
+    """Listen to OTP group messages and forward to users - Unlimited timeout"""
     global last_update_id
     
-    print("🔄 Group listener started...")
+    print("🔄 Group listener started - Monitoring OTP group...")
     
     while True:
         try:
-            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=30)
+            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=100)
             
             for update in updates:
                 last_update_id = update.update_id
@@ -919,16 +967,18 @@ async def listen_to_group(app):
                     
                     chat_title = msg.chat.title if msg.chat else ""
                     
-                    if "OTP" in chat_title or "Otp" in chat_title:
+                    if "OTP" in chat_title or "Otp" in chat_title or "otp" in chat_title.lower():
                         text = msg.text or msg.caption or ""
                         
                         if not text:
                             continue
                         
                         # Extract number from message
-                        number_match = re.search(r'📱\s*\*?Number\*?:\s*`?([+\d\*]+)`?', text, re.IGNORECASE)
+                        number_match = re.search(r'📱\s*\*?Number\*?:\s*`?([+\d]+)`?', text, re.IGNORECASE)
                         if not number_match:
-                            number_match = re.search(r'`([+\d\*]+)`', text)
+                            number_match = re.search(r'Number:\s*`?([+\d]+)`?', text, re.IGNORECASE)
+                        if not number_match:
+                            number_match = re.search(r'`([+\d]{10,15})`', text)
                         
                         if number_match:
                             masked_number = number_match.group(1)
@@ -938,7 +988,7 @@ async def listen_to_group(app):
                             if not otp_match:
                                 otp_match = re.search(r'OTP\s*Code:\s*`?(\d{4,6})`?', text, re.IGNORECASE)
                             if not otp_match:
-                                otp_match = re.search(r'\b(\d{4,6})\b', text)
+                                otp_match = re.search(r'`(\d{4,6})`', text)
                             
                             if otp_match:
                                 otp = otp_match.group(1)
@@ -961,11 +1011,10 @@ async def listen_to_group(app):
                                 
                                 for uid, active_data in user_active_numbers.items():
                                     for num in active_data.get('numbers', []):
-                                        if len(num) >= 8 and len(masked_number) >= 8:
-                                            if num[-4:] == masked_number[-4:] or num[:4] == masked_number[:4]:
-                                                full_number = num
-                                                target_user = uid
-                                                break
+                                        if num == masked_number or num.endswith(masked_number[-8:]) or masked_number.endswith(num[-8:]):
+                                            full_number = num
+                                            target_user = uid
+                                            break
                                     if target_user:
                                         break
                                 
@@ -987,6 +1036,10 @@ async def listen_to_group(app):
                                     })
                                     save_data()
                                     
+                                    # Update the user's message with OTP
+                                    otp_text = get_otp_received_text(full_number, country, otp, service, price, user_balances[target_user])
+                                    
+                                    # Send to user
                                     await app.bot.send_message(
                                         target_user,
                                         f"🔐 *OTP Received!*\n\n"
@@ -999,11 +1052,12 @@ async def listen_to_group(app):
                                         parse_mode=ParseMode.MARKDOWN
                                     )
                                     
+                                    # Remove from active numbers
                                     if target_user in user_active_numbers:
                                         if full_number in user_active_numbers[target_user]['numbers']:
                                             user_active_numbers[target_user]['numbers'].remove(full_number)
                                     
-                                    print(f"✅ OTP {otp} forwarded to user {target_user}")
+                                    print(f"✅ OTP {otp} forwarded to user {target_user} for number {full_number}")
                                     
         except Exception as e:
             print(f"Group listener error: {e}")
@@ -1350,10 +1404,6 @@ def health():
     })
 
 # ==================== MAIN ====================
-async def start_group_listener(app):
-    await asyncio.sleep(2)
-    asyncio.create_task(listen_to_group(app))
-
 if __name__ == '__main__':
     try:
         import telegram
@@ -1378,10 +1428,9 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    # Start group listener
     async def post_init(app):
         asyncio.create_task(listen_to_group(app))
-        print("✅ Group listener started")
+        print("✅ Group listener started - Monitoring OTP group for messages")
     
     application.post_init = post_init
     
