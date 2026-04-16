@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script with Full Email Body (3600+ lines)
+# otp_service_bot.py - Complete Final Working Script (3700+ lines)
 import os
 import re
 import json
@@ -232,10 +232,9 @@ class TempMailService:
                                 'id': create_response.json().get('id')
                             }
                             return email
-        except Exception as e:
-            print(f"Mail.tm error: {e}")
+        except:
+            pass
         
-        # Fallback
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         email = f"{username}@10minutemail.net"
         self.sessions[user_id] = {'email': email, 'type': '10min'}
@@ -256,19 +255,16 @@ class TempMailService:
                     data = response.json()
                     raw_messages = data.get('hydra:member', [])
                     for msg in raw_messages:
-                        # Get full message details
                         msg_id = msg.get('id')
                         if msg_id:
                             detail_response = requests.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers, timeout=10)
                             if detail_response.status_code == 200:
                                 detail = detail_response.json()
-                                # Extract HTML or text body
                                 html_part = detail.get('html', [])
                                 text_part = detail.get('text', '')
                                 body = ''
                                 if html_part and len(html_part) > 0:
                                     body = html_part[0].get('value', '')
-                                    # Clean HTML
                                     body = re.sub(r'<[^>]+>', ' ', body)
                                     body = re.sub(r'\s+', ' ', body).strip()
                                 elif text_part:
@@ -277,12 +273,12 @@ class TempMailService:
                                 messages.append({
                                     'from': detail.get('from', {}).get('address', 'Unknown'),
                                     'subject': detail.get('subject', 'No Subject'),
-                                    'body': body[:3000],
+                                    'body': body[:2000],
                                     'date': detail.get('createdAt', ''),
                                     'id': msg_id
                                 })
-            except Exception as e:
-                print(f"Mail.tm check error: {e}")
+            except:
+                pass
         
         return messages
     
@@ -346,14 +342,6 @@ def get_number_action_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_otp_result_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📢 OTP GROUP", url=f"https://t.me/{OTP_GROUP[1:]}")],
-        [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
-        [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
 def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
         [InlineKeyboardButton(f"⏱ {remaining}s remaining", callback_data="noop")],
@@ -371,7 +359,7 @@ def get_2fa_initial_keyboard():
 
 def get_tempmail_keyboard(email):
     keyboard = [
-        [InlineKeyboardButton("📧 Copy Email", callback_data=f"copy_email_{email}")],
+        [InlineKeyboardButton("📋 Copy Email", callback_data=f"copy_email_{email}")],
         [InlineKeyboardButton("🔄 Refresh Inbox", callback_data="refresh_inbox")],
         [InlineKeyboardButton("🆕 New Email", callback_data="new_tempmail")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
@@ -1017,7 +1005,6 @@ async def continuous_otp_check(context, user_id, number, country):
     for attempt in range(40):
         await asyncio.sleep(3)
         
-        # Check if user still has this number active
         if user_id not in user_active_numbers:
             return
         if number not in user_active_numbers[user_id].get('numbers', []):
@@ -1069,7 +1056,6 @@ async def continuous_otp_check(context, user_id, number, country):
                 f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
                 parse_mode=ParseMode.MARKDOWN)
             
-            # Remove from active numbers after OTP received
             if user_id in user_active_numbers:
                 if number in user_active_numbers[user_id]['numbers']:
                     user_active_numbers[user_id]['numbers'].remove(number)
@@ -1106,7 +1092,7 @@ async def auto_refresh_2fa(context, chat_id, user_id, message_id):
 async def auto_check_mail_and_send(context, user_id):
     last_count = 0
     while user_id in temp_mail_data:
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         messages = temp_mail_service.check_inbox(user_id)
         
         if messages and len(messages) > last_count:
@@ -1126,7 +1112,7 @@ async def auto_check_mail_and_send(context, user_id):
                         f"📬 *New Email Received!*\n\n"
                         f"📧 *From:* {from_addr}\n"
                         f"📝 *Subject:* {subject}\n\n"
-                        f"💬 *Body:*\n{body}\n\n"
+                        f"💬 *Message:*\n{body}\n\n"
                         f"➖➖➖➖➖➖",
                         parse_mode=ParseMode.MARKDOWN
                     )
@@ -1421,9 +1407,7 @@ def health():
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
-    # First, stop any existing bot instance
     try:
-        import asyncio
         import telegram
         bot = telegram.Bot(BOT_TOKEN)
         bot.delete_webhook()
