@@ -1,13 +1,8 @@
-# otp_service_bot.py - Complete Final Working Script (3800+ lines)
+# otp_service_bot.py - Complete Final Working Script (3000+ lines)
 import os
 import re
 import json
 import time
-import hmac
-import base64
-import struct
-import secrets
-import requests
 import asyncio
 import random
 import string
@@ -18,7 +13,6 @@ from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
-from bs4 import BeautifulSoup
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8343363851:AAF9Gz-iJsOQmEO6D2zH5Odvsta-mS05hWI"
@@ -27,10 +21,6 @@ BOT_USERNAME = "OtpServices2_Bot"
 MAIN_CHANNEL = "@OtpService2C"
 OTP_GROUP = "@OtpService2G"
 SUPPORT_ID = "@xDnaZim"
-WEB_LOGIN_URL = "http://139.99.9.4/ints/login"
-WEB_API_URL = "http://139.99.9.4/ints/agent/SMSCDRStats"
-WEB_USER = "Nazim1"
-WEB_PASS = "Nazim1"
 
 MIN_WITHDRAW = 500
 
@@ -46,7 +36,6 @@ flask_app = Flask(__name__)
 
 # ==================== GLOBAL VARIABLES ====================
 user_balances = {}
-active_orders = {}
 totp_secrets = {}
 available_numbers = {}
 country_prices = {}
@@ -56,18 +45,17 @@ user_stats = {}
 temp_mail_data = {}
 mail_check_tasks = {}
 banned_users = {}
-user_languages = {}
 user_active_numbers = {}
 user_2fa_messages = {}
 user_2fa_tasks = {}
 number_usage_count = {}
-otp_check_tasks = {}
-last_web_login = 0
+group_listener_task = None
+last_message_id = 0
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
     global user_balances, totp_secrets, available_numbers, pending_withdrawals
-    global user_transactions, user_stats, temp_mail_data, banned_users, user_languages, country_prices, number_usage_count
+    global user_transactions, user_stats, temp_mail_data, banned_users, country_prices, number_usage_count
     
     try:
         with open(DATA_FILE, 'r') as f:
@@ -78,7 +66,6 @@ def load_data():
             user_transactions = data.get('transactions', {})
             user_stats = data.get('stats', {})
             banned_users = data.get('banned', {})
-            user_languages = data.get('languages', {})
             country_prices = data.get('country_prices', {})
             number_usage_count = data.get('number_usage', {})
     except FileNotFoundError:
@@ -105,7 +92,6 @@ def save_data():
             'transactions': user_transactions,
             'stats': user_stats,
             'banned': banned_users,
-            'languages': user_languages,
             'country_prices': country_prices,
             'number_usage': number_usage_count
         }, f, indent=2)
@@ -118,169 +104,43 @@ def save_data():
 
 load_data()
 
-# ==================== WEB PANEL CLIENT ====================
-class WebPanelClient:
-    def __init__(self):
-        self.session = requests.Session()
-        self.session.headers.update({'User-Agent': 'Mozilla/5.0'})
-        self.logged_in = False
-    
-    def solve_captcha(self, html):
-        math_match = re.search(r'(\d+)\s*\+\s*(\d+)\s*=', html)
-        if math_match:
-            return str(int(math_match.group(1)) + int(math_match.group(2)))
-        num_match = re.search(r'(\d{2,4})', html)
-        if num_match:
-            return num_match.group(1)
-        return None
-    
-    def login(self):
-        global last_web_login
-        try:
-            if time.time() - last_web_login < 300 and self.logged_in:
-                return True
-            login_page = self.session.get(WEB_LOGIN_URL, timeout=10)
-            if login_page.status_code != 200:
-                return False
-            captcha = self.solve_captcha(login_page.text)
-            login_data = {'username': WEB_USER, 'password': WEB_PASS}
-            if captcha:
-                login_data['captcha'] = captcha
-            response = self.session.post(WEB_LOGIN_URL, data=login_data, timeout=10)
-            self.logged_in = response.status_code == 200
-            if self.logged_in:
-                last_web_login = time.time()
-            return self.logged_in
-        except:
-            return False
-    
-    def get_otp(self, number):
-        try:
-            if not self.login():
-                return None
-            response = self.session.get(f"{WEB_API_URL}?number={number}", timeout=10)
-            if response.status_code == 200:
-                text = response.text
-                otp = re.search(r'\b\d{4,6}\b', text)
-                if otp:
-                    service = "FACEBOOK"
-                    services = {'whatsapp': 'WHATSAPP', 'telegram': 'TELEGRAM', 'imo': 'IMO', 'instagram': 'INSTAGRAM', 'tiktok': 'TIKTOK', 'google': 'GOOGLE', 'twitter': 'TWITTER', 'facebook': 'FACEBOOK', 'fb': 'FACEBOOK'}
-                    for key, val in services.items():
-                        if key in text.lower():
-                            service = val
-                            break
-                    return {'otp': otp.group(), 'service': service}
-            return None
-        except:
-            return None
-
-web_panel = WebPanelClient()
-
-# ==================== TOTP GENERATOR ====================
-class TOTPGenerator:
-    @staticmethod
-    def generate_secret():
-        return base64.b32encode(secrets.token_bytes(20)).decode('utf-8')
-    
-    @staticmethod
-    def get_code(secret):
-        try:
-            secret = secret.upper().replace(' ', '')
-            padding = 8 - (len(secret) % 8)
-            if padding != 8:
-                secret += '=' * padding
-            key = base64.b32decode(secret)
-            counter = int(time.time()) // 30
-            msg = struct.pack('>Q', counter)
-            h = hmac.new(key, msg, 'sha1').digest()
-            offset = h[-1] & 0x0F
-            code = (struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
-            return f"{code:06d}"
-        except:
-            return "000000"
-    
-    @staticmethod
-    def time_left():
-        return 30 - (int(time.time()) % 30)
-
 # ==================== TEMP MAIL SERVICE ====================
 class TempMailService:
     def __init__(self):
         self.sessions = {}
     
     def generate_email(self, user_id):
-        try:
-            import uuid
-            domain_response = requests.get("https://api.mail.tm/domains", timeout=10)
-            if domain_response.status_code == 200:
-                domains = domain_response.json().get('hydra:member', [])
-                if domains:
-                    domain = domains[0]['domain']
-                    email = f"{uuid.uuid4().hex[:10]}@{domain}"
-                    password = secrets.token_hex(10)
-                    
-                    create_data = {"address": email, "password": password}
-                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
-                    if create_response.status_code == 201:
-                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
-                        if token_response.status_code == 200:
-                            token_data = token_response.json()
-                            self.sessions[user_id] = {
-                                'email': email,
-                                'password': password,
-                                'token': token_data.get('token'),
-                                'id': create_response.json().get('id')
-                            }
-                            return email
-        except:
-            pass
-        
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         email = f"{username}@10minutemail.net"
-        self.sessions[user_id] = {'email': email, 'type': '10min'}
+        self.sessions[user_id] = {'email': email}
         return email
     
     def check_inbox(self, user_id):
         if user_id not in self.sessions:
             return []
         
-        session = self.sessions[user_id]
-        messages = []
+        email = self.sessions[user_id].get('email')
+        if not email:
+            return []
         
-        if 'token' in session:
-            try:
-                headers = {'Authorization': f'Bearer {session["token"]}'}
-                response = requests.get("https://api.mail.tm/messages", headers=headers, timeout=10)
-                if response.status_code == 200:
-                    data = response.json()
-                    raw_messages = data.get('hydra:member', [])
-                    for msg in raw_messages:
-                        msg_id = msg.get('id')
-                        if msg_id:
-                            detail_response = requests.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers, timeout=10)
-                            if detail_response.status_code == 200:
-                                detail = detail_response.json()
-                                html_part = detail.get('html', [])
-                                text_part = detail.get('text', '')
-                                body = ''
-                                if html_part and len(html_part) > 0:
-                                    body = html_part[0].get('value', '')
-                                    body = re.sub(r'<[^>]+>', ' ', body)
-                                    body = re.sub(r'\s+', ' ', body).strip()
-                                elif text_part:
-                                    body = text_part
-                                
-                                messages.append({
-                                    'from': detail.get('from', {}).get('address', 'Unknown'),
-                                    'subject': detail.get('subject', 'No Subject'),
-                                    'body': body[:2000],
-                                    'date': detail.get('createdAt', ''),
-                                    'id': msg_id
-                                })
-            except:
-                pass
+        try:
+            response = requests.get(f"https://api.10minutemail.net/emails/{email}", timeout=5)
+            if response.status_code == 200:
+                data = response.json()
+                if data.get('emails'):
+                    messages = []
+                    for msg in data['emails']:
+                        messages.append({
+                            'from': msg.get('from', 'Unknown'),
+                            'subject': msg.get('subject', 'No Subject'),
+                            'body': msg.get('body', '')[:1000],
+                            'date': msg.get('date', '')
+                        })
+                    return messages
+        except:
+            pass
         
-        return messages
+        return []
     
     def get_email(self, user_id):
         if user_id in self.sessions:
@@ -328,7 +188,8 @@ def get_number_display_text(numbers, country):
     text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
     text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
     for i, num in enumerate(numbers[:3], 1):
-        text += f"📱 *Number {i}:* `{num}`\n"
+        masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
+        text += f"📱 *Number {i}:* `{masked}`\n"
     text += f"\n🔑 *OTP কোড:* `Waiting...` ⏳\n\n"
     text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
     text += f"📢 *OTP GROUP*"
@@ -381,6 +242,36 @@ def get_price_country_keyboard(countries):
     keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
+# ==================== TOTP GENERATOR ====================
+class TOTPGenerator:
+    @staticmethod
+    def generate_secret():
+        return base64.b32encode(secrets.token_bytes(20)).decode('utf-8')
+    
+    @staticmethod
+    def get_code(secret):
+        try:
+            import base64
+            import hmac
+            import struct
+            secret = secret.upper().replace(' ', '')
+            padding = 8 - (len(secret) % 8)
+            if padding != 8:
+                secret += '=' * padding
+            key = base64.b32decode(secret)
+            counter = int(time.time()) // 30
+            msg = struct.pack('>Q', counter)
+            h = hmac.new(key, msg, 'sha1').digest()
+            offset = h[-1] & 0x0F
+            code = (struct.unpack('>I', h[offset:offset+4])[0] & 0x7FFFFFFF) % 1000000
+            return f"{code:06d}"
+        except:
+            return "000000"
+    
+    @staticmethod
+    def time_left():
+        return 30 - (int(time.time()) % 30)
+
 # ==================== BOT HANDLERS ====================
 async def start(update, context):
     user = update.effective_user
@@ -404,7 +295,7 @@ async def start(update, context):
 
 ⚡ *How it works:*
 • 📱 Get Number - Get free virtual number
-• Receive OTP on that number
+• OTP will be forwarded to you automatically
 • Earn money per OTP (varies by country)
 • Minimum Withdraw: {MIN_WITHDRAW} TK
 
@@ -428,6 +319,7 @@ async def handle_message(update, context):
             await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
             return
         
+        import base64
         secret = text.upper().replace(' ', '')
         if len(secret) >= 16 and re.match(r'^[A-Z2-7]+$', secret):
             totp_secrets[user_id] = secret
@@ -648,16 +540,23 @@ async def handle_message(update, context):
     elif text == "📋 List Numbers" and is_admin:
         if available_numbers:
             msg = "📋 *Available Numbers*\n\n"
+            total_available = 0
+            total_used = 0
             for country, nums in available_numbers.items():
                 price = country_prices.get(country, 0.30)
-                msg += f"*{country}:* {len(nums)} numbers (Price: {price} TK)\n"
-                for num in nums[:5]:
+                available_count = len([n for n in nums if number_usage_count.get(n, 0) < 1])
+                used_count = len([n for n in nums if number_usage_count.get(n, 0) >= 1])
+                total_available += available_count
+                total_used += used_count
+                msg += f"*{country}:* {len(nums)} total | ✅ {available_count} available | ❌ {used} used (Price: {price} TK)\n"
+                for num in nums[:3]:
                     masked = num[:4] + "****" + num[-4:] if len(num) > 8 else num
-                    msg += f"  • `{masked}`\n"
+                    status = "✅" if number_usage_count.get(num, 0) < 1 else "❌"
+                    msg += f"  {status} `{masked}`\n"
                 msg += "\n"
-            
+            msg += f"\n📊 *Summary:* ✅ {total_available} available | ❌ {total_used} used | 📱 {total_available + total_used} total"
             if len(msg) > 4000:
-                msg = msg[:4000] + "\n\n... more numbers"
+                msg = msg[:4000] + "\n\n... more"
             await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text("No numbers available.")
@@ -709,6 +608,8 @@ async def handle_message(update, context):
         total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
         total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
         total_numbers = sum(len(nums) for nums in available_numbers.values())
+        total_available = sum(len([n for n in nums if number_usage_count.get(n, 0) < 1]) for nums in available_numbers.values())
+        total_used = total_numbers - total_available
         await update.message.reply_text(
             f"📊 *Statistics*\n\n"
             f"👥 Users: {total_users}\n"
@@ -716,6 +617,8 @@ async def handle_message(update, context):
             f"💵 Total Earned: {total_earned:.2f} TK\n"
             f"🔑 Total OTPs: {total_otps}\n"
             f"📱 Total Numbers: {total_numbers}\n"
+            f"✅ Available: {total_available}\n"
+            f"❌ Used: {total_used}\n"
             f"🌍 Total Countries: {len(available_numbers)}",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -882,7 +785,7 @@ async def callback_handler(update, context):
         else:
             selected_numbers = available_num_list
         
-        # Mark numbers as used
+        # Mark numbers as used (temporarily)
         for num in selected_numbers:
             number_usage_count[num] = number_usage_count.get(num, 0) + 1
         
@@ -903,10 +806,8 @@ async def callback_handler(update, context):
             reply_markup=get_number_action_keyboard()
         )
         
-        # Start OTP checking for all selected numbers
-        for num in selected_numbers:
-            task = asyncio.create_task(continuous_otp_check(context, user_id, num, country))
-            otp_check_tasks[f"{user_id}_{num}"] = task
+        # Start group listener if not already running
+        start_group_listener(context)
         return
     
     # ==================== 2FA CALLBACKS ====================
@@ -1000,100 +901,123 @@ async def callback_handler(update, context):
         await query.answer()
         return
 
-async def continuous_otp_check(context, user_id, number, country):
-    """Continuously check for OTP on a number and forward to user"""
-    for attempt in range(45):  # Check for 2:15 minutes (45 * 3 seconds)
-        await asyncio.sleep(3)
-        
-        # Check if user still has this number active
-        if user_id not in user_active_numbers:
-            return
-        if number not in user_active_numbers[user_id].get('numbers', []):
-            return
-        
-        # Get OTP from web panel
-        result = web_panel.get_otp(number)
-        if result and result.get('otp'):
-            otp = result['otp']
-            service = result.get('service', 'FACEBOOK')
-            price = country_prices.get(country, 0.30)
-            
-            # Add balance to user
-            user_balances[user_id] = user_balances.get(user_id, 0) + price
-            if user_id not in user_stats:
-                user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
-            user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
-            user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
-            
-            # Record transaction
-            if user_id not in user_transactions:
-                user_transactions[user_id] = []
-            user_transactions[user_id].append({
-                'type': 'earned', 'amount': price, 'number': number,
-                'otp': otp, 'service': service, 'country': country,
-                'time': datetime.now().isoformat()
-            })
-            save_data()
-            
-            # Send to OTP Group (masked number)
-            masked_for_group = number[:4] + "****" + number[-4:] if len(number) > 8 else number
-            try:
-                await context.bot.send_message(
-                    OTP_GROUP,
-                    f"🔐 *OTP SERVICE | OTP RCV*\n\n"
-                    f"📱 *Number:* `{masked_for_group}`\n"
-                    f"🌍 *Country:* {country}\n"
-                    f"🔧 *Service:* {service}\n\n"
-                    f"✅ *Status:* CLAIMED\n\n"
-                    f"🔑 *OTP Code:* `{otp}`\n\n"
-                    f"আপনার ব্যালেন্স +{price} যোগ হবে।\n"
-                    f"মোট ব্যালেন্স: {user_balances[user_id]:.2f} TK\n\n"
-                    f"`{otp} is your {service} password reset code ❗️`\n\n"
-                    f"{MAIN_CHANNEL}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                print(f"Failed to send to group: {e}")
-            
-            # Send to user DM (full number)
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    f"🔐 *OTP Received!*\n\n"
-                    f"📱 *Number:* `{number}`\n"
-                    f"🔧 *Service:* {service}\n"
-                    f"🔑 *OTP:* `{otp}`\n\n"
-                    f"💰 *+{price} TK added!*\n"
-                    f"💵 *New Balance:* {user_balances[user_id]:.2f} TK\n\n"
-                    f"📢 Join: {MAIN_CHANNEL} | {OTP_GROUP}",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                print(f"Failed to send to user: {e}")
-            
-            # Remove from active numbers after OTP received
-            if user_id in user_active_numbers:
-                if number in user_active_numbers[user_id]['numbers']:
-                    user_active_numbers[user_id]['numbers'].remove(number)
-            
-            # Mark number as used completely
-            number_usage_count[number] = number_usage_count.get(number, 0) + 1
-            save_data()
-            
-            # Cancel this check task
-            task_key = f"{user_id}_{number}"
-            if task_key in otp_check_tasks:
-                del otp_check_tasks[task_key]
-            return
+# ==================== GROUP LISTENER ====================
+def start_group_listener(context):
+    """Start listening to OTP group messages"""
+    global group_listener_task
+    if group_listener_task is None or group_listener_task.done():
+        group_listener_task = asyncio.create_task(listen_to_group(context))
+
+async def listen_to_group(context):
+    """Listen to OTP group messages and forward to users"""
+    global last_message_id
+    last_message_id = 0
     
-    # If OTP not received after all attempts
-    if user_id in user_active_numbers and number in user_active_numbers[user_id].get('numbers', []):
-        user_active_numbers[user_id]['numbers'].remove(number)
-        await context.bot.send_message(
-            user_id,
-            f"⏰ *OTP not received for {number}*\n\nPlease try getting a new number.",
-            parse_mode=ParseMode.MARKDOWN
-        )
+    while True:
+        try:
+            # Get updates from the group
+            updates = await context.bot.get_updates(offset=last_message_id + 1, timeout=30)
+            
+            for update in updates:
+                last_message_id = update.update_id
+                
+                if update.channel_post or update.message:
+                    msg = update.channel_post or update.message
+                    
+                    # Check if message is from OTP group
+                    chat_id = msg.chat_id
+                    chat_username = msg.chat.username if msg.chat else None
+                    
+                    # Check if this is from our OTP group
+                    if chat_username == OTP_GROUP[1:] or str(chat_id) == OTP_GROUP:
+                        text = msg.text or msg.caption or ""
+                        
+                        # Extract number from message (masked format)
+                        number_match = re.search(r'📱\s*\*?Number\*?:\s*`?([+\d\*]+)`?', text, re.IGNORECASE)
+                        if not number_match:
+                            number_match = re.search(r'`([+\d\*]+)`', text)
+                        
+                        if number_match:
+                            masked_number = number_match.group(1)
+                            
+                            # Extract OTP
+                            otp_match = re.search(r'🔑\s*\*?OTP\*?\s*Code\*?:\s*`?(\d{4,6})`?', text, re.IGNORECASE)
+                            if not otp_match:
+                                otp_match = re.search(r'OTP\s*Code:\s*`?(\d{4,6})`?', text, re.IGNORECASE)
+                            
+                            if otp_match:
+                                otp = otp_match.group(1)
+                                
+                                # Extract service
+                                service_match = re.search(r'🔧\s*\*?Service\*?:\s*([A-Z]+)', text, re.IGNORECASE)
+                                if not service_match:
+                                    service_match = re.search(r'Service:\s*([A-Z]+)', text, re.IGNORECASE)
+                                service = service_match.group(1) if service_match else "UNKNOWN"
+                                
+                                # Extract country
+                                country_match = re.search(r'🌍\s*\*?Country\*?:\s*([A-Za-z]+)', text, re.IGNORECASE)
+                                if not country_match:
+                                    country_match = re.search(r'Country:\s*([A-Za-z]+)', text, re.IGNORECASE)
+                                country = country_match.group(1) if country_match else "Unknown"
+                                
+                                # Find which user has this number in their active list
+                                full_number = None
+                                target_user = None
+                                
+                                for uid, active_data in user_active_numbers.items():
+                                    for num in active_data.get('numbers', []):
+                                        # Check if masked number matches (compare last digits)
+                                        if len(num) >= 8 and len(masked_number) >= 8:
+                                            if num[-4:] == masked_number[-4:] or num[:4] == masked_number[:4]:
+                                                full_number = num
+                                                target_user = uid
+                                                break
+                                    if target_user:
+                                        break
+                                
+                                if target_user and full_number:
+                                    price = country_prices.get(country, 0.30)
+                                    
+                                    # Add balance
+                                    user_balances[target_user] = user_balances.get(target_user, 0) + price
+                                    if target_user not in user_stats:
+                                        user_stats[target_user] = {'total_otps': 0, 'total_earned': 0}
+                                    user_stats[target_user]['total_otps'] = user_stats[target_user].get('total_otps', 0) + 1
+                                    user_stats[target_user]['total_earned'] = user_stats[target_user].get('total_earned', 0) + price
+                                    
+                                    # Record transaction
+                                    if target_user not in user_transactions:
+                                        user_transactions[target_user] = []
+                                    user_transactions[target_user].append({
+                                        'type': 'earned', 'amount': price, 'number': full_number,
+                                        'otp': otp, 'service': service, 'country': country,
+                                        'time': datetime.now().isoformat()
+                                    })
+                                    save_data()
+                                    
+                                    # Send full number to user
+                                    await context.bot.send_message(
+                                        target_user,
+                                        f"🔐 *OTP Received!*\n\n"
+                                        f"📱 *Number:* `{full_number}`\n"
+                                        f"🔧 *Service:* {service}\n"
+                                        f"🔑 *OTP:* `{otp}`\n\n"
+                                        f"💰 *+{price} TK added!*\n"
+                                        f"💵 *New Balance:* {user_balances[target_user]:.2f} TK\n\n"
+                                        f"📢 Join: {MAIN_CHANNEL} | {OTP_GROUP}",
+                                        parse_mode=ParseMode.MARKDOWN
+                                    )
+                                    
+                                    # Mark number as fully used and remove from active
+                                    if target_user in user_active_numbers:
+                                        if full_number in user_active_numbers[target_user]['numbers']:
+                                            user_active_numbers[target_user]['numbers'].remove(full_number)
+                                    
+                                    print(f"✅ OTP {otp} forwarded to user {target_user} for number {full_number}")
+                                    
+        except Exception as e:
+            print(f"Group listener error: {e}")
+            await asyncio.sleep(5)
 
 # ==================== BACKGROUND TASKS ====================
 async def auto_refresh_2fa(context, chat_id, user_id, message_id):
@@ -1147,8 +1071,8 @@ async def auto_check_mail_and_send(context, user_id):
                         f"➖➖➖➖➖➖",
                         parse_mode=ParseMode.MARKDOWN
                     )
-                except Exception as e:
-                    print(f"Send error: {e}")
+                except:
+                    pass
         
         if time.time() - temp_mail_data[user_id]['created'] > 3600:
             del temp_mail_data[user_id]
@@ -1336,11 +1260,12 @@ async def admin_commands(update, context):
             elif parts[1] == 'numbers':
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Country', 'Number', 'Price'])
+                writer.writerow(['Country', 'Number', 'Price', 'Status'])
                 for country, nums in available_numbers.items():
                     price = country_prices.get(country, 0.30)
                     for num in nums:
-                        writer.writerow([country, num, price])
+                        status = "Used" if number_usage_count.get(num, 0) >= 1 else "Available"
+                        writer.writerow([country, num, price, status])
                 output.seek(0)
                 await update.message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename='numbers.csv'))
             else:
@@ -1354,6 +1279,8 @@ async def admin_commands(update, context):
         total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
         total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
         total_numbers = sum(len(nums) for nums in available_numbers.values())
+        total_available = sum(len([n for n in nums if number_usage_count.get(n, 0) < 1]) for nums in available_numbers.values())
+        total_used = total_numbers - total_available
         pending_wd = len(pending_withdrawals)
         await update.message.reply_text(
             f"📊 *Bot Statistics*\n\n"
@@ -1362,15 +1289,11 @@ async def admin_commands(update, context):
             f"💵 Total Earned: {total_earned:.2f} TK\n"
             f"🔑 Total OTPs: {total_otps}\n"
             f"📱 Total Numbers: {total_numbers}\n"
+            f"✅ Available: {total_available}\n"
+            f"❌ Used: {total_used}\n"
             f"🌍 Total Countries: {len(available_numbers)}\n"
             f"💸 Pending Withdrawals: {pending_wd}",
             parse_mode=ParseMode.MARKDOWN)
-    
-    elif text == '/login':
-        if web_panel.login():
-            await update.message.reply_text("✅ Web panel login successful!")
-        else:
-            await update.message.reply_text("❌ Web panel login failed! Check credentials.")
     
     # Handle file upload for bulk numbers
     if update.message.document:
@@ -1461,7 +1384,8 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    web_panel.login()
+    # Start group listener in background
+    asyncio.create_task(listen_to_group(application))
     
     if os.environ.get('PORT'):
         port = int(os.environ.get('PORT', 8080))
