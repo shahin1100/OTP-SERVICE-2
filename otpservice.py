@@ -56,6 +56,7 @@ user_2fa_tasks = {}
 number_usage_count = {}
 group_listener_task = None
 last_update_id = 0
+application = None
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -900,7 +901,7 @@ async def callback_handler(update, context):
         return
 
 # ==================== GROUP LISTENER ====================
-async def listen_to_group(application):
+async def listen_to_group(app):
     """Listen to OTP group messages and forward to users"""
     global last_update_id
     
@@ -908,8 +909,7 @@ async def listen_to_group(application):
     
     while True:
         try:
-            # Get updates from the group
-            updates = await application.bot.get_updates(offset=last_update_id + 1, timeout=30)
+            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=30)
             
             for update in updates:
                 last_update_id = update.update_id
@@ -917,14 +917,9 @@ async def listen_to_group(application):
                 if update.channel_post or update.message:
                     msg = update.channel_post or update.message
                     
-                    # Check if message is from OTP group
-                    chat_id = msg.chat_id
-                    chat_username = msg.chat.username if msg.chat else None
-                    
-                    # Check if this is from our OTP group
                     chat_title = msg.chat.title if msg.chat else ""
                     
-                    if "OTP" in chat_title or chat_username == OTP_GROUP[1:]:
+                    if "OTP" in chat_title or "Otp" in chat_title:
                         text = msg.text or msg.caption or ""
                         
                         if not text:
@@ -960,13 +955,12 @@ async def listen_to_group(application):
                                     country_match = re.search(r'Country:\s*([A-Za-z]+)', text, re.IGNORECASE)
                                 country = country_match.group(1) if country_match else "Unknown"
                                 
-                                # Find which user has this number in their active list
+                                # Find which user has this number
                                 target_user = None
                                 full_number = None
                                 
                                 for uid, active_data in user_active_numbers.items():
                                     for num in active_data.get('numbers', []):
-                                        # Compare masked number
                                         if len(num) >= 8 and len(masked_number) >= 8:
                                             if num[-4:] == masked_number[-4:] or num[:4] == masked_number[:4]:
                                                 full_number = num
@@ -978,14 +972,12 @@ async def listen_to_group(application):
                                 if target_user and full_number:
                                     price = country_prices.get(country, 0.30)
                                     
-                                    # Add balance
                                     user_balances[target_user] = user_balances.get(target_user, 0) + price
                                     if target_user not in user_stats:
                                         user_stats[target_user] = {'total_otps': 0, 'total_earned': 0}
                                     user_stats[target_user]['total_otps'] = user_stats[target_user].get('total_otps', 0) + 1
                                     user_stats[target_user]['total_earned'] = user_stats[target_user].get('total_earned', 0) + price
                                     
-                                    # Record transaction
                                     if target_user not in user_transactions:
                                         user_transactions[target_user] = []
                                     user_transactions[target_user].append({
@@ -995,8 +987,7 @@ async def listen_to_group(application):
                                     })
                                     save_data()
                                     
-                                    # Send full number to user
-                                    await application.bot.send_message(
+                                    await app.bot.send_message(
                                         target_user,
                                         f"🔐 *OTP Received!*\n\n"
                                         f"📱 *Number:* `{full_number}`\n"
@@ -1008,7 +999,6 @@ async def listen_to_group(application):
                                         parse_mode=ParseMode.MARKDOWN
                                     )
                                     
-                                    # Remove from active numbers
                                     if target_user in user_active_numbers:
                                         if full_number in user_active_numbers[target_user]['numbers']:
                                             user_active_numbers[target_user]['numbers'].remove(full_number)
@@ -1360,6 +1350,10 @@ def health():
     })
 
 # ==================== MAIN ====================
+async def start_group_listener(app):
+    await asyncio.sleep(2)
+    asyncio.create_task(listen_to_group(app))
+
 if __name__ == '__main__':
     try:
         import telegram
@@ -1384,9 +1378,9 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    # Start group listener as a background task after application is running
-    async def post_init():
-        asyncio.create_task(listen_to_group(application))
+    # Start group listener
+    async def post_init(app):
+        asyncio.create_task(listen_to_group(app))
         print("✅ Group listener started")
     
     application.post_init = post_init
