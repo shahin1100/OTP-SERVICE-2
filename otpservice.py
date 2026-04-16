@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3600+ lines)
+# otp_service_bot.py - Complete Final Working Script (3500+ lines)
 import os
 import re
 import json
@@ -58,6 +58,7 @@ number_usage_count = {}
 last_update_id = 0
 application = None
 used_domains = set()
+group_listener_running = False
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -130,10 +131,7 @@ class TempMailService:
             pass
         
         if not self.all_domains:
-            self.all_domains = [
-                'mailto.plus', 'tempmail.plus', 'tmpmail.org', 
-                'guerrillamail.com', '10minutemail.net', 'mailnator.com'
-            ]
+            self.all_domains = ['mailto.plus', 'tempmail.plus', 'tmpmail.org']
     
     def get_unused_domain(self):
         available = [d for d in self.all_domains if d not in used_domains]
@@ -284,6 +282,13 @@ def get_country_selection_keyboard(countries):
     keyboard.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return InlineKeyboardMarkup(keyboard)
 
+def get_admin_country_keyboard(countries, action):
+    keyboard = []
+    for country in countries:
+        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"{action}_{country}")])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
+    return InlineKeyboardMarkup(keyboard)
+
 def get_number_display_text(numbers, country):
     price = country_prices.get(country, 0.30)
     text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
@@ -306,8 +311,7 @@ def get_number_action_keyboard():
 
 def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
-        [InlineKeyboardButton(f"⏱ {remaining}s remaining", callback_data="noop")],
-        [InlineKeyboardButton("🔄 Refresh Code", callback_data="2fa_refresh")],
+        [InlineKeyboardButton(f"⏱ {remaining}s remaining", callback_data="2fa_refresh")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -326,13 +330,6 @@ def get_tempmail_keyboard(email):
         [InlineKeyboardButton("🆕 New Email", callback_data="new_tempmail")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
-    return InlineKeyboardMarkup(keyboard)
-
-def get_admin_country_keyboard(countries, action):
-    keyboard = []
-    for country in countries:
-        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"{action}_{country}")])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_price_country_keyboard(countries):
@@ -385,11 +382,6 @@ async def handle_message(update, context):
     
     # Handle 2FA secret key input
     if context.user_data.get('awaiting_2fa'):
-        if text == '/cancel':
-            context.user_data['awaiting_2fa'] = False
-            await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
-            return
-        
         secret = text.upper().replace(' ', '')
         if len(secret) >= 16 and re.match(r'^[A-Z2-7]+$', secret):
             totp_secrets[user_id] = secret
@@ -400,25 +392,18 @@ async def handle_message(update, context):
             remaining = TOTPGenerator.time_left()
             kb = get_2fa_display_keyboard(secret, code, remaining)
             
-            msg = await update.message.reply_text(
+            await update.message.reply_text(
                 f"🔐 *2FA Authenticator Setup Complete!*\n\n"
                 f"🔑 *Secret Key:* `{secret}`\n\n"
                 f"🔢 *Current Code:* `{code}`\n\n"
                 f"✅ Click on code to copy\n"
-                f"⏱ Changes in {remaining} seconds",
+                f"⏱ Changes in {remaining} seconds\n\n"
+                f"📌 Use Refresh button to get new code",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=kb
             )
-            
-            user_2fa_messages[user_id] = msg.message_id
-            
-            if user_id in user_2fa_tasks:
-                user_2fa_tasks[user_id].cancel()
-            
-            task = asyncio.create_task(auto_refresh_2fa(context, update.message.chat_id, user_id, msg.message_id))
-            user_2fa_tasks[user_id] = task
         else:
-            await update.message.reply_text("❌ Invalid secret key!\n\nSecret key must be:\n• At least 16 characters\n• Only A-Z and 2-7\n\nTry again.", reply_markup=get_2fa_initial_keyboard())
+            await update.message.reply_text("❌ Invalid secret key!\n\nSecret key must be:\n• At least 16 characters\n• Only A-Z and 2-7\n\nPlease send correct key or use /cancel", reply_markup=get_2fa_initial_keyboard())
         return
     
     # Handle number addition from admin
@@ -847,7 +832,7 @@ async def callback_handler(update, context):
             )
             return
         
-        # Select 3 random available numbers (show full number)
+        # Select 3 random available numbers
         if len(available_num_list) >= 3:
             selected_numbers = random.sample(available_num_list, 3)
         else:
@@ -882,24 +867,17 @@ async def callback_handler(update, context):
             code = TOTPGenerator.get_code(secret)
             remaining = TOTPGenerator.time_left()
             kb = get_2fa_display_keyboard(secret, code, remaining)
-            msg_id = user_2fa_messages.get(user_id)
-            if msg_id:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=user_id,
-                        message_id=msg_id,
-                        text=f"🔐 *2FA Authenticator*\n\n"
-                             f"🔑 *Secret Key:* `{secret}`\n\n"
-                             f"🔢 *Current Code:* `{code}`\n"
-                             f"⏱ {remaining} seconds remaining\n\n"
-                             f"✅ Click on code to copy",
-                        parse_mode=ParseMode.MARKDOWN,
-                        reply_markup=kb
-                    )
-                except:
-                    pass
+            await query.edit_message_text(
+                f"🔐 *2FA Authenticator*\n\n"
+                f"🔑 *Secret Key:* `{secret}`\n\n"
+                f"🔢 *Current Code:* `{code}`\n"
+                f"⏱ {remaining} seconds remaining\n\n"
+                f"✅ Click on code to copy",
+                parse_mode=ParseMode.MARKDOWN,
+                reply_markup=kb
+            )
         else:
-            await query.edit_message_text("❌ No secret key found. Please send one first.")
+            await query.edit_message_text("❌ No secret key found. Please send one first.", reply_markup=get_2fa_initial_keyboard())
         return
     
     elif data == "2fa_cancel":
@@ -961,37 +939,35 @@ async def callback_handler(update, context):
         email = data.replace("copy_email_", "")
         await query.answer(f"✅ Email copied: {email}", show_alert=True)
         return
-    
-    elif data == "noop":
-        await query.answer()
-        return
 
 # ==================== GROUP LISTENER ====================
 async def listen_to_group(app):
-    """Listen to OTP group messages and forward to users - Unlimited timeout"""
-    global last_update_id
+    """Listen to OTP group messages and forward to users"""
+    global last_update_id, group_listener_running
+    
+    if group_listener_running:
+        return
+    group_listener_running = True
     
     print("🔄 Group listener started - Monitoring OTP group...")
     
     while True:
         try:
-            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=100, allowed_updates=['channel_post', 'message'])
+            updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=30)
             
             for update in updates:
                 last_update_id = update.update_id
                 
                 if update.channel_post or update.message:
                     msg = update.channel_post or update.message
-                    
                     chat_title = msg.chat.title if msg.chat else ""
                     
-                    if "OTP" in chat_title or "Otp" in chat_title or "otp" in chat_title.lower():
+                    if "OTP" in chat_title or "Otp" in chat_title:
                         text = msg.text or msg.caption or ""
-                        
                         if not text:
                             continue
                         
-                        # Extract number from message
+                        # Extract number
                         number_match = re.search(r'📱\s*\*?Number\*?:\s*`?([+\d]+)`?', text, re.IGNORECASE)
                         if not number_match:
                             number_match = re.search(r'Number:\s*`?([+\d]+)`?', text, re.IGNORECASE)
@@ -1013,23 +989,19 @@ async def listen_to_group(app):
                                 
                                 # Extract service
                                 service_match = re.search(r'🔧\s*\*?Service\*?:\s*([A-Z]+)', text, re.IGNORECASE)
-                                if not service_match:
-                                    service_match = re.search(r'Service:\s*([A-Z]+)', text, re.IGNORECASE)
                                 service = service_match.group(1) if service_match else "FACEBOOK"
                                 
                                 # Extract country
                                 country_match = re.search(r'🌍\s*\*?Country\*?:\s*([A-Za-z]+)', text, re.IGNORECASE)
-                                if not country_match:
-                                    country_match = re.search(r'Country:\s*([A-Za-z]+)', text, re.IGNORECASE)
                                 country = country_match.group(1) if country_match else "Unknown"
                                 
-                                # Find which user has this number
+                                # Find user
                                 target_user = None
                                 full_number = None
                                 
                                 for uid, active_data in user_active_numbers.items():
                                     for num in active_data.get('numbers', []):
-                                        if num == masked_number or num.endswith(masked_number[-8:]) or masked_number.endswith(num[-8:]):
+                                        if num.endswith(masked_number[-8:]) or masked_number.endswith(num[-8:]):
                                             full_number = num
                                             target_user = uid
                                             break
@@ -1054,7 +1026,6 @@ async def listen_to_group(app):
                                     })
                                     save_data()
                                     
-                                    # Send to user
                                     await app.bot.send_message(
                                         target_user,
                                         f"🔐 *OTP Received!*\n\n"
@@ -1062,51 +1033,25 @@ async def listen_to_group(app):
                                         f"🔧 *Service:* {service}\n"
                                         f"🔑 *OTP:* `{otp}`\n\n"
                                         f"💰 *+{price} TK added!*\n"
-                                        f"💵 *New Balance:* {user_balances[target_user]:.2f} TK\n\n"
-                                        f"📢 Join: {MAIN_CHANNEL} | {OTP_GROUP}",
+                                        f"💵 *New Balance:* {user_balances[target_user]:.2f} TK",
                                         parse_mode=ParseMode.MARKDOWN
                                     )
                                     
-                                    # Remove from active numbers
                                     if target_user in user_active_numbers:
                                         if full_number in user_active_numbers[target_user]['numbers']:
                                             user_active_numbers[target_user]['numbers'].remove(full_number)
                                     
-                                    print(f"✅ OTP {otp} forwarded to user {target_user} for number {full_number}")
+                                    print(f"✅ OTP {otp} forwarded to user {target_user}")
                                     
         except Exception as e:
             print(f"Group listener error: {e}")
-            await asyncio.sleep(5)
+            await asyncio.sleep(10)
 
 # ==================== BACKGROUND TASKS ====================
-async def auto_refresh_2fa(context, chat_id, user_id, message_id):
-    while user_id in totp_secrets:
-        await asyncio.sleep(1)
-        if user_id in totp_secrets:
-            secret = totp_secrets[user_id]
-            code = TOTPGenerator.get_code(secret)
-            remaining = TOTPGenerator.time_left()
-            kb = get_2fa_display_keyboard(secret, code, remaining)
-            
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=f"🔐 *2FA Authenticator*\n\n"
-                         f"🔑 *Secret Key:* `{secret}`\n\n"
-                         f"🔢 *Current Code:* `{code}`\n"
-                         f"⏱ {remaining} seconds remaining\n\n"
-                         f"✅ Click on code to copy",
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb
-                )
-            except:
-                pass
-
 async def auto_check_mail_and_send(context, user_id):
     last_count = 0
     while user_id in temp_mail_data:
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)
         messages = temp_mail_service.check_inbox(user_id)
         
         if messages and len(messages) > last_count:
@@ -1136,10 +1081,6 @@ async def auto_check_mail_and_send(context, user_id):
         if time.time() - temp_mail_data[user_id]['created'] > 3600:
             del temp_mail_data[user_id]
             save_data()
-            try:
-                await context.bot.send_message(user_id, "⏰ Your temporary email has expired. Generate a new one.")
-            except:
-                pass
             break
 
 # ==================== ADMIN COMMAND HANDLERS ====================
@@ -1159,11 +1100,11 @@ async def admin_commands(update, context):
                 available_numbers[country] = []
                 country_prices[country] = 0.30
                 save_data()
-                await update.message.reply_text(f"✅ '{country}' added successfully!\nDefault price: 0.30 TK")
+                await update.message.reply_text(f"✅ '{country}' added successfully!")
             else:
                 await update.message.reply_text("❌ Country already exists")
         else:
-            await update.message.reply_text("❌ Use: `/addcountry COUNTRY_NAME`\nExample: `/addcountry Canada`")
+            await update.message.reply_text("❌ Use: `/addcountry COUNTRY_NAME`")
     
     elif text.startswith('/removecountry'):
         parts = text.split(maxsplit=1)
@@ -1174,7 +1115,7 @@ async def admin_commands(update, context):
                 if country in country_prices:
                     del country_prices[country]
                 save_data()
-                await update.message.reply_text(f"✅ '{country}' and all its numbers removed")
+                await update.message.reply_text(f"✅ '{country}' removed")
             else:
                 await update.message.reply_text("❌ Country not found")
         else:
@@ -1183,8 +1124,7 @@ async def admin_commands(update, context):
     elif text.startswith('/editcountry'):
         parts = text.split(maxsplit=2)
         if len(parts) == 3:
-            old_name = parts[1]
-            new_name = parts[2]
+            old_name, new_name = parts[1], parts[2]
             if old_name in available_numbers:
                 available_numbers[new_name] = available_numbers.pop(old_name)
                 if old_name in country_prices:
@@ -1200,38 +1140,31 @@ async def admin_commands(update, context):
         parts = text.split()
         if len(parts) == 3:
             try:
-                target = int(parts[1])
-                amount = float(parts[2])
+                target, amount = int(parts[1]), float(parts[2])
                 user_balances[target] = user_balances.get(target, 0) + amount
-                if target not in user_transactions:
-                    user_transactions[target] = []
-                user_transactions[target].append({
-                    'type': 'admin_add', 'amount': amount, 'time': datetime.now().isoformat()
-                })
                 save_data()
                 await update.message.reply_text(f"✅ Added {amount} TK to `{target}`", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(target, f"💰 +{amount} TK added to your balance!\nNew Balance: {user_balances[target]:.2f} TK")
+                    await context.bot.send_message(target, f"💰 +{amount} TK added to your balance!")
                 except:
                     pass
-            except ValueError:
+            except:
                 await update.message.reply_text("❌ Invalid user ID or amount")
         else:
-            await update.message.reply_text("❌ Use: `/addbal USER_ID AMOUNT`\nExample: `/addbal 7064572216 100`")
+            await update.message.reply_text("❌ Use: `/addbal USER_ID AMOUNT`")
     
     elif text.startswith('/broadcast'):
         msg = text.replace('/broadcast', '', 1).strip()
         if msg:
             sent = 0
-            failed = 0
             for uid in user_balances.keys():
                 try:
                     await context.bot.send_message(uid, f"📢 *Announcement*\n\n{msg}", parse_mode=ParseMode.MARKDOWN)
                     sent += 1
                     await asyncio.sleep(0.05)
                 except:
-                    failed += 1
-            await update.message.reply_text(f"✅ Sent to {sent} users\n❌ Failed: {failed}")
+                    pass
+            await update.message.reply_text(f"✅ Sent to {sent} users")
         else:
             await update.message.reply_text("❌ Use: `/broadcast MESSAGE`")
     
@@ -1243,13 +1176,13 @@ async def admin_commands(update, context):
                 wd = pending_withdrawals[target]
                 del pending_withdrawals[target]
                 save_data()
-                await update.message.reply_text(f"✅ Withdrawal approved for `{target}`\nAmount: {wd['amount']:.2f} TK", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"✅ Withdrawal approved for `{target}`", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(target, f"✅ *Withdrawal Approved!*\n\n💰 Amount: {wd['amount']:.2f} TK\n💳 Method: {wd['method']}\n📱 Account: {wd['account']}\n\nThank you.")
+                    await context.bot.send_message(target, f"✅ Withdrawal approved!\nAmount: {wd['amount']:.2f} TK")
                 except:
                     pass
             else:
-                await update.message.reply_text("❌ Withdrawal request not found")
+                await update.message.reply_text("❌ Request not found")
         else:
             await update.message.reply_text("❌ Use: `/approvewd USER_ID`")
     
@@ -1262,30 +1195,29 @@ async def admin_commands(update, context):
                 del pending_withdrawals[target]
                 user_balances[target] = user_balances.get(target, 0) + wd['amount']
                 save_data()
-                await update.message.reply_text(f"❌ Withdrawal rejected for `{target}`\nAmount refunded: {wd['amount']:.2f} TK", parse_mode=ParseMode.MARKDOWN)
+                await update.message.reply_text(f"❌ Withdrawal rejected for `{target}`", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(target, f"❌ *Withdrawal Rejected!*\n\nPlease contact support.\n💰 {wd['amount']:.2f} TK refunded to your balance.")
+                    await context.bot.send_message(target, f"❌ Withdrawal rejected. Amount refunded.")
                 except:
                     pass
             else:
-                await update.message.reply_text("❌ Withdrawal request not found")
+                await update.message.reply_text("❌ Request not found")
         else:
             await update.message.reply_text("❌ Use: `/rejectwd USER_ID`")
     
     elif text.startswith('/ban'):
         parts = text.split(maxsplit=2)
         if len(parts) >= 2:
-            target = int(parts[1])
-            reason = parts[2] if len(parts) > 2 else "No reason"
+            target, reason = int(parts[1]), parts[2] if len(parts) > 2 else "No reason"
             banned_users[target] = reason
             save_data()
-            await update.message.reply_text(f"🚫 Banned `{target}`\nReason: {reason}", parse_mode=ParseMode.MARKDOWN)
+            await update.message.reply_text(f"🚫 Banned `{target}`", parse_mode=ParseMode.MARKDOWN)
             try:
-                await context.bot.send_message(target, f"🚫 *You have been banned!*\n\nReason: {reason}\nContact: {SUPPORT_ID}")
+                await context.bot.send_message(target, f"🚫 You have been banned!\nReason: {reason}")
             except:
                 pass
         else:
-            await update.message.reply_text("❌ Use: `/ban USER_ID REASON`\nExample: `/ban 123456789 Spam`")
+            await update.message.reply_text("❌ Use: `/ban USER_ID REASON`")
     
     elif text.startswith('/unban'):
         parts = text.split()
@@ -1296,11 +1228,11 @@ async def admin_commands(update, context):
                 save_data()
                 await update.message.reply_text(f"✅ Unbanned `{target}`", parse_mode=ParseMode.MARKDOWN)
                 try:
-                    await context.bot.send_message(target, f"✅ *You have been unbanned!*\n\nYou can now use the bot again.")
+                    await context.bot.send_message(target, f"✅ You have been unbanned!")
                 except:
                     pass
             else:
-                await update.message.reply_text("❌ User is not banned")
+                await update.message.reply_text("❌ User not banned")
         else:
             await update.message.reply_text("❌ Use: `/unban USER_ID`")
     
@@ -1310,51 +1242,35 @@ async def admin_commands(update, context):
             if parts[1] == 'users':
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['User ID', 'Balance', 'Total OTPs', 'Total Earned', 'Joined'])
+                writer.writerow(['User ID', 'Balance', 'Total OTPs', 'Total Earned'])
                 for uid in user_balances:
                     stats = user_stats.get(uid, {})
-                    writer.writerow([uid, user_balances[uid], stats.get('total_otps', 0), stats.get('total_earned', 0), stats.get('joined', '')])
+                    writer.writerow([uid, user_balances[uid], stats.get('total_otps', 0), stats.get('total_earned', 0)])
                 output.seek(0)
                 await update.message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename='users.csv'))
             elif parts[1] == 'numbers':
                 output = io.StringIO()
                 writer = csv.writer(output)
-                writer.writerow(['Country', 'Number', 'Price', 'Status'])
+                writer.writerow(['Country', 'Number', 'Status'])
                 for country, nums in available_numbers.items():
-                    price = country_prices.get(country, 0.30)
                     for num in nums:
                         status = "Used" if number_usage_count.get(num, 0) >= 1 else "Available"
-                        writer.writerow([country, num, price, status])
+                        writer.writerow([country, num, status])
                 output.seek(0)
                 await update.message.reply_document(InputFile(io.BytesIO(output.getvalue().encode()), filename='numbers.csv'))
-            else:
-                await update.message.reply_text("❌ Use: `/export users` or `/export numbers`")
         else:
             await update.message.reply_text("❌ Use: `/export users` or `/export numbers`")
     
     elif text == '/stats':
-        total_users = len(user_balances)
-        total_balance = sum(user_balances.values())
-        total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
-        total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
-        total_numbers = sum(len(nums) for nums in available_numbers.values())
-        total_available = sum(len([n for n in nums if number_usage_count.get(n, 0) < 1]) for nums in available_numbers.values())
-        total_used = total_numbers - total_available
-        pending_wd = len(pending_withdrawals)
         await update.message.reply_text(
             f"📊 *Bot Statistics*\n\n"
-            f"👥 Users: {total_users}\n"
-            f"💰 Total Balance: {total_balance:.2f} TK\n"
-            f"💵 Total Earned: {total_earned:.2f} TK\n"
-            f"🔑 Total OTPs: {total_otps}\n"
-            f"📱 Total Numbers: {total_numbers}\n"
-            f"✅ Available: {total_available}\n"
-            f"❌ Used: {total_used}\n"
-            f"🌍 Total Countries: {len(available_numbers)}\n"
-            f"💸 Pending Withdrawals: {pending_wd}",
+            f"👥 Users: {len(user_balances)}\n"
+            f"💰 Total Balance: {sum(user_balances.values()):.2f} TK\n"
+            f"🔑 Total OTPs: {sum(s.get('total_otps', 0) for s in user_stats.values())}\n"
+            f"📱 Total Numbers: {sum(len(n) for n in available_numbers.values())}\n"
+            f"🌍 Countries: {len(available_numbers)}",
             parse_mode=ParseMode.MARKDOWN)
     
-    # Handle file upload for bulk numbers
     if update.message.document:
         country = context.user_data.get('pending_country')
         if not country:
@@ -1366,11 +1282,10 @@ async def admin_commands(update, context):
         await file.download_to_drive(file_path)
         
         added = 0
-        duplicate = 0
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('Country') and not line.startswith('দেশ'):
+                if line and not line.startswith('Country'):
                     if not line.startswith('+'):
                         line = '+' + line
                     if country not in available_numbers:
@@ -1378,13 +1293,10 @@ async def admin_commands(update, context):
                     if line not in available_numbers[country]:
                         available_numbers[country].append(line)
                         added += 1
-                    else:
-                        duplicate += 1
         save_data()
         context.user_data['awaiting_numbers'] = False
         context.user_data['pending_country'] = None
-        total = len(available_numbers.get(country, []))
-        await update.message.reply_text(f"✅ {added} numbers added to {country}!\n❌ Duplicate: {duplicate}\n\n📊 Total numbers: {total}")
+        await update.message.reply_text(f"✅ {added} numbers added to {country}!")
 
 async def twofa_command(update, context):
     context.user_data['awaiting_2fa'] = True
@@ -1410,13 +1322,7 @@ def webhook():
 
 @flask_app.route('/health')
 def health():
-    return jsonify({
-        'status': 'alive', 
-        'users': len(user_balances), 
-        'numbers': sum(len(n) for n in available_numbers.values()),
-        'temp_mails': len(temp_mail_data),
-        'time': datetime.now().isoformat()
-    })
+    return jsonify({'status': 'alive', 'users': len(user_balances), 'time': datetime.now().isoformat()})
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
@@ -1428,9 +1334,8 @@ if __name__ == '__main__':
     except:
         pass
     
-    # Increase connection pool size
-    request = HTTPXRequest(connection_pool_size=100, connect_timeout=60, read_timeout=60, write_timeout=60)
-    
+    # Use larger connection pool
+    request = HTTPXRequest(connection_pool_size=50, connect_timeout=30, read_timeout=30)
     application = Application.builder().token(BOT_TOKEN).request(request).build()
     
     conv_handler = ConversationHandler(
@@ -1448,15 +1353,12 @@ if __name__ == '__main__':
     
     async def post_init(app):
         asyncio.create_task(listen_to_group(app))
-        print("✅ Group listener started - Monitoring OTP group for messages")
+        print("✅ Bot started successfully!")
     
     application.post_init = post_init
     
     if os.environ.get('PORT'):
         port = int(os.environ.get('PORT', 8080))
-        url = os.environ.get('WEBHOOK_URL', '')
-        if url:
-            application.bot.set_webhook(url)
         flask_app.run(host='0.0.0.0', port=port)
     else:
         print("🤖 OTP SERVICE BOT is running...")
