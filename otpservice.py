@@ -61,9 +61,8 @@ user_active_numbers = {}
 user_2fa_messages = {}
 user_2fa_tasks = {}
 number_usage_count = {}
+otp_check_tasks = {}
 last_web_login = 0
-web_session = None
-pending_admin_action = {}
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -304,14 +303,15 @@ def get_country_selection_keyboard(countries):
     for country in countries:
         if available_numbers.get(country):
             count = len(available_numbers[country])
-            keyboard.append([InlineKeyboardButton(f"🌍 {country} ({count} নম্বর)", callback_data=f"user_select_country_{country}")])
+            keyboard.append([InlineKeyboardButton(f"🌍 {country} ({count} numbers)", callback_data=f"user_select_country_{country}")])
     keyboard.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return InlineKeyboardMarkup(keyboard)
 
 def get_number_display_text(numbers, country):
+    price = country_prices.get(country, 0.40)
     text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
     text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-    text += f"🌍 *দেশ ও দাম:* {country} ({country_prices.get(country, 0.40)}TK)\n\n"
+    text += f"🌍 *দেশ ও দাম:* {country} ({price}TK)\n\n"
     for i, num in enumerate(numbers[:3], 1):
         text += f"📱 *Number {i}:* `{num}`\n"
     text += f"\n🔑 *OTP কোড:* `Waiting...` ⏳\n\n"
@@ -319,7 +319,7 @@ def get_number_display_text(numbers, country):
     text += f"📢 *OTP GROUP*"
     return text
 
-def get_number_action_keyboard(numbers, country):
+def get_number_action_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 OTP GROUP", url=f"https://t.me/{OTP_GROUP[1:]}")],
         [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
@@ -327,21 +327,13 @@ def get_number_action_keyboard(numbers, country):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_otp_result_keyboard(number, country, otp, service, balance):
-    masked_num = number[:4] + "****" + number[-4:] if len(number) > 8 else number
-    text = f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-    text += f"🇧🇩 *নাজার যাচাই সম্পন্ন*\n"
-    text += f"🌍 *দেশ ও দাম:* {country} ({country_prices.get(country, 0.40)}TK)\n\n"
-    text += f"🔑 *OTP কোড:* `{otp}` ✅\n\n"
-    text += f"✅ *NUMBER VERIFIED SUCCESSFULLY*\n\n"
-    text += f"📢 *OTP GROUP*"
-    
+def get_otp_result_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 OTP GROUP", url=f"https://t.me/{OTP_GROUP[1:]}")],
         [InlineKeyboardButton("🔄 Change Number", callback_data="change_number")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
-    return text, InlineKeyboardMarkup(keyboard)
+    return InlineKeyboardMarkup(keyboard)
 
 def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
@@ -378,7 +370,7 @@ def get_price_country_keyboard(countries):
     keyboard = []
     for country in countries:
         current_price = country_prices.get(country, 0.30)
-        keyboard.append([InlineKeyboardButton(f"🌍 {country} (বর্তমান: {current_price} TK)", callback_data=f"setprice_{country}")])
+        keyboard.append([InlineKeyboardButton(f"🌍 {country} (Current: {current_price} TK)", callback_data=f"setprice_{country}")])
     keyboard.append([InlineKeyboardButton("🔙 Back to Admin", callback_data="back_to_admin")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -389,7 +381,7 @@ async def start(update, context):
     is_admin = user_id == ADMIN_ID
     
     if user_id in banned_users:
-        await update.message.reply_text("❌ আপনি এই বট ব্যবহার করতে পারবেন না।")
+        await update.message.reply_text("❌ You are banned from using this bot.")
         return
     
     if user_id not in user_balances:
@@ -397,19 +389,19 @@ async def start(update, context):
         user_stats[user_id] = {'joined': datetime.now().isoformat(), 'total_otps': 0, 'total_earned': 0}
         save_data()
     
-    welcome_text = f"""🎉 *GetPaid OTP 2.0* এ স্বাগতম 🎉
+    welcome_text = f"""🎉 *OTP SERVICE BOT* এ স্বাগতম 🎉
 
-👤 *ইউজার:* {user.first_name}
-💰 *ব্যালেন্স:* {user_balances.get(user_id, 0):.2f} TK
-📊 *মোট আয়:* {user_stats.get(user_id, {}).get('total_earned', 0):.2f} TK
+👤 *User:* {user.first_name}
+💰 *Balance:* {user_balances.get(user_id, 0):.2f} TK
+📊 *Total Earned:* {user_stats.get(user_id, {}).get('total_earned', 0):.2f} TK
 
-⚡ *কিভাবে কাজ করে:*
-• 📱 Get Number - ফ্রি নম্বর নিন
-• OTP রিসিভ করুন
-• প্রতি OTP তে পান দেশ অনুযায়ী TK
-• মিনিমাম উইথড্র: {MIN_WITHDRAW} TK
+⚡ *How it works:*
+• 📱 Get Number - Get free virtual number
+• Receive OTP on that number
+• Earn money per OTP (varies by country)
+• Minimum Withdraw: {MIN_WITHDRAW} TK
 
-👇 *নিচের বাটন থেকে সিলেক্ট করুন:*"""
+👇 *Choose an option:*"""
 
     await update.message.reply_text(welcome_text, parse_mode=ParseMode.MARKDOWN, reply_markup=get_main_keyboard(is_admin))
 
@@ -419,7 +411,7 @@ async def handle_message(update, context):
     is_admin = user_id == ADMIN_ID
     
     if user_id in banned_users:
-        await update.message.reply_text("❌ আপনি বanned!")
+        await update.message.reply_text("❌ You are banned!")
         return
     
     # Handle 2FA secret key input
@@ -440,11 +432,11 @@ async def handle_message(update, context):
             kb = get_2fa_display_keyboard(secret, code, remaining)
             
             msg = await update.message.reply_text(
-                f"🔐 *2FA সেটআপ সম্পূর্ণ!*\n\n"
-                f"🔑 *সিক্রেট কী:* `{secret}`\n\n"
-                f"🔢 *বর্তমান কোড:* `{code}`\n\n"
-                f"✅ কোডটি কপি করতে কোডের উপর ক্লিক করুন\n"
-                f"⏱ {remaining} সেকেন্ড পর কোড পরিবর্তন হবে",
+                f"🔐 *2FA Authenticator Setup Complete!*\n\n"
+                f"🔑 *Secret Key:* `{secret}`\n\n"
+                f"🔢 *Current Code:* `{code}`\n\n"
+                f"✅ Click on code to copy\n"
+                f"⏱ Changes in {remaining} seconds",
                 parse_mode=ParseMode.MARKDOWN,
                 reply_markup=kb
             )
@@ -457,7 +449,7 @@ async def handle_message(update, context):
             task = asyncio.create_task(auto_refresh_2fa(context, update.message.chat_id, user_id, msg.message_id))
             user_2fa_tasks[user_id] = task
         else:
-            await update.message.reply_text("❌ ভুল সিক্রেট কী!\n\nসিক্রেট কী হতে হবে:\n• কমপক্ষে 16 অক্ষর\n• শুধুমাত্র A-Z এবং 2-7\n\nআবার চেষ্টা করুন।", reply_markup=get_2fa_initial_keyboard())
+            await update.message.reply_text("❌ Invalid secret key!\n\nSecret key must be:\n• At least 16 characters\n• Only A-Z and 2-7\n\nTry again.", reply_markup=get_2fa_initial_keyboard())
         return
     
     # Handle number addition from admin
@@ -483,12 +475,12 @@ async def handle_message(update, context):
             context.user_data['awaiting_numbers'] = False
             context.user_data['pending_country'] = None
             total = len(available_numbers.get(country, []))
-            await update.message.reply_text(f"✅ {added} টি নম্বর {country} দেশে যোগ করা হয়েছে!\n❌ ডুপ্লিকেট: {duplicate}\n\n📊 মোট নম্বর: {total} টি")
+            await update.message.reply_text(f"✅ {added} numbers added to {country}!\n❌ Duplicate: {duplicate}\n\n📊 Total numbers: {total}")
             return
         elif text == '/cancel':
             context.user_data['awaiting_numbers'] = False
             context.user_data['pending_country'] = None
-            await update.message.reply_text("❌ নম্বর যোগ করা বাতিল করা হয়েছে।")
+            await update.message.reply_text("❌ Number addition cancelled.")
             return
     
     # Handle price setting from admin
@@ -498,35 +490,35 @@ async def handle_message(update, context):
             try:
                 price = float(text)
                 if price < 0:
-                    await update.message.reply_text("❌ দাম ০ এর কম হতে পারে না!")
+                    await update.message.reply_text("❌ Price cannot be negative!")
                     return
                 country_prices[country] = price
                 save_data()
                 context.user_data['awaiting_price'] = False
                 context.user_data['price_country'] = None
-                await update.message.reply_text(f"✅ {country} দেশের OTP দাম সেট করা হয়েছে: {price} TK")
+                await update.message.reply_text(f"✅ {country} OTP price set to: {price} TK")
             except ValueError:
-                await update.message.reply_text("❌ ভুল দাম! একটি সংখ্যা দিন। (যেমন: 0.30)")
+                await update.message.reply_text("❌ Invalid price! Enter a number (e.g., 0.30)")
             return
         elif text == '/cancel':
             context.user_data['awaiting_price'] = False
             context.user_data['price_country'] = None
-            await update.message.reply_text("❌ দাম সেট করা বাতিল করা হয়েছে।")
+            await update.message.reply_text("❌ Price setting cancelled.")
             return
     
     # ==================== MAIN MENU ====================
     if text == "📱 Get Number":
         if not available_numbers:
-            await update.message.reply_text("❌ কোনো দেশ উপলব্ধ নেই। অ্যাডমিন প্রথমে দেশ যোগ করুন।")
+            await update.message.reply_text("❌ No countries available. Admin please add countries first.")
             return
         
         countries = [c for c in available_numbers.keys() if available_numbers[c]]
         if not countries:
-            await update.message.reply_text("❌ কোনো দেশে নম্বর উপলব্ধ নেই। অ্যাডমিন নম্বর যোগ করুন।")
+            await update.message.reply_text("❌ No numbers available in any country. Admin please add numbers.")
             return
         
         await update.message.reply_text(
-            "🌍 *দেশ সিলেক্ট করুন*\n\nনিচ থেকে আপনার পছন্দের দেশ নির্বাচন করুন:",
+            "🌍 *Select Country*\n\nChoose your country:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_country_selection_keyboard(countries)
         )
@@ -549,9 +541,9 @@ async def handle_message(update, context):
         await update.message.reply_text(
             f"📧 *YOUR TEMP EMAIL IS READY*\n\n"
             f"📨 `{email}`\n\n"
-            f"⚡ Cek kecepatan mail kamu saat ini!\n"
-            f"akan lebih cepat lagi jika Anda mengirimkan emailnya di bawah ini.\n\n"
-            f"💡 ইমেইল কপি করতে ইমেইলের উপর ক্লিক করুন।",
+            f"⚡ Check your mail speed!\n"
+            f"Emails will appear automatically when received.\n\n"
+            f"💡 Click on email to copy",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_tempmail_keyboard(email)
         )
@@ -562,7 +554,7 @@ async def handle_message(update, context):
             "🔐 *2FA Authenticator*\n\n"
             "📝 *Send your Authenticator Secret Key*\n\n"
             "Example: `JBSWY3DPEHPK3PXP`\n\n"
-            "👇 *নিচের বাটন থেকে বাতিল করুন:*",
+            "👇 *Click Cancel to cancel:*",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_2fa_initial_keyboard()
         )
@@ -637,11 +629,11 @@ async def handle_message(update, context):
     # ==================== ADMIN COMMANDS ====================
     elif text == "➕ Add Number" and is_admin:
         if not available_numbers:
-            await update.message.reply_text("❌ প্রথমে একটি দেশ যোগ করুন। '🌍 Edit Country' বাটন ব্যবহার করুন।")
+            await update.message.reply_text("❌ Please add a country first using '🌍 Edit Country' button.")
             return
         countries = list(available_numbers.keys())
         await update.message.reply_text(
-            "🌍 *কোন দেশে নম্বর যোগ করবেন?*\n\nনিচ থেকে দেশ নির্বাচন করুন:",
+            "🌍 *Which country to add numbers to?*\n\nSelect a country:",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_admin_country_keyboard(countries, "addnum_country")
         )
@@ -864,7 +856,7 @@ async def callback_handler(update, context):
             )
             return
         
-        # Check if numbers are available (not all used)
+        # Check available numbers (not used)
         available_num_list = [num for num in numbers if number_usage_count.get(num, 0) < 1]
         if not available_num_list:
             await query.edit_message_text(
@@ -883,7 +875,7 @@ async def callback_handler(update, context):
         else:
             selected_numbers = available_num_list
         
-        # Mark these numbers as used
+        # Mark numbers as used
         for num in selected_numbers:
             number_usage_count[num] = number_usage_count.get(num, 0) + 1
         
@@ -901,71 +893,13 @@ async def callback_handler(update, context):
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.MARKDOWN,
-            reply_markup=get_number_action_keyboard(selected_numbers, country)
+            reply_markup=get_number_action_keyboard()
         )
-        return
-    
-    # Check OTP for selected numbers
-    elif data.startswith("check_otp_for_"):
-        number = data.replace("check_otp_for_", "")
-        country = context.user_data.get('selected_country', 'Unknown')
         
-        result = web_panel.get_otp(number)
-        if result and result.get('otp'):
-            otp = result['otp']
-            service = result.get('service', 'FACEBOOK')
-            price = country_prices.get(country, 0.30)
-            
-            user_balances[user_id] = user_balances.get(user_id, 0) + price
-            if user_id not in user_stats:
-                user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
-            user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
-            user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
-            
-            if user_id not in user_transactions:
-                user_transactions[user_id] = []
-            user_transactions[user_id].append({
-                'type': 'earned', 'amount': price, 'number': number,
-                'otp': otp, 'service': service, 'country': country,
-                'time': datetime.now().isoformat()
-            })
-            save_data()
-            
-            # Send to OTP Group (masked number)
-            masked_for_group = number[:4] + "****" + number[-4:] if len(number) > 8 else number
-            await context.bot.send_message(OTP_GROUP,
-                f"🔐 *GetPaid OTP 2.0 | OTP RCV*\n\n"
-                f"📱 *Number:* `{masked_for_group}`\n"
-                f"🌍 *Country:* {country}\n"
-                f"🔧 *Service:* {service}\n\n"
-                f"✅ *Status:* CLAIMED\n\n"
-                f"🔑 *OTP Code:* `{otp}`\n\n"
-                f"আপনার ব্যালেন্স +{price} যোগ হবে।\n"
-                f"মোট ব্যালেন্স: {user_balances[user_id]:.2f} TK\n\n"
-                f"`{otp} is your {service} password reset code ❗️`\n\n"
-                f"{MAIN_CHANNEL}",
-                parse_mode=ParseMode.MARKDOWN)
-            
-            # Send to user (full number)
-            text, kb = get_otp_result_keyboard(number, country, otp, service, user_balances[user_id])
-            await query.edit_message_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=kb
-            )
-            
-            await context.bot.send_message(user_id,
-                f"🔐 *OTP Received!*\n\n"
-                f"📱 *Number:* `{number}`\n"
-                f"🔧 *Service:* {service}\n"
-                f"🔑 *OTP:* `{otp}`\n\n"
-                f"💰 *+{price} TK added!*\n"
-                f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
-                parse_mode=ParseMode.MARKDOWN)
-        else:
-            # Schedule OTP check
-            asyncio.create_task(wait_and_check_otp(context, user_id, number, country, query.message.chat_id, query.message.message_id))
-            await query.answer("Waiting for OTP... Please wait 1-2 minutes.", show_alert=True)
+        # Start OTP checking for all selected numbers
+        for num in selected_numbers:
+            if num not in otp_check_tasks:
+                otp_check_tasks[num] = asyncio.create_task(continuous_otp_check(context, user_id, num, country))
         return
     
     # ==================== 2FA CALLBACKS ====================
@@ -1042,8 +976,8 @@ async def callback_handler(update, context):
         await query.edit_message_text(
             f"📧 *YOUR TEMP EMAIL IS READY*\n\n"
             f"📨 `{email}`\n\n"
-            f"⚡ Cek kecepatan mail kamu saat ini!\n"
-            f"akan lebih cepat lagi jika Anda mengirimkan emailnya di bawah ini.\n\n"
+            f"⚡ Check your mail speed!\n"
+            f"Emails will appear automatically when received.\n\n"
             f"💡 Click on email to copy",
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=get_tempmail_keyboard(email)
@@ -1059,9 +993,17 @@ async def callback_handler(update, context):
         await query.answer()
         return
 
-async def wait_and_check_otp(context, user_id, number, country, chat_id, message_id):
+async def continuous_otp_check(context, user_id, number, country):
+    """Continuously check for OTP on a number"""
     for attempt in range(40):
         await asyncio.sleep(3)
+        
+        # Check if user still has this number active
+        if user_id not in user_active_numbers:
+            return
+        if number not in user_active_numbers[user_id].get('numbers', []):
+            return
+        
         result = web_panel.get_otp(number)
         if result and result.get('otp'):
             otp = result['otp']
@@ -1086,7 +1028,7 @@ async def wait_and_check_otp(context, user_id, number, country, chat_id, message
             # Send to OTP Group (masked number)
             masked_for_group = number[:4] + "****" + number[-4:] if len(number) > 8 else number
             await context.bot.send_message(OTP_GROUP,
-                f"🔐 *GetPaid OTP 2.0 | OTP RCV*\n\n"
+                f"🔐 *OTP SERVICE | OTP RCV*\n\n"
                 f"📱 *Number:* `{masked_for_group}`\n"
                 f"🌍 *Country:* {country}\n"
                 f"🔧 *Service:* {service}\n\n"
@@ -1098,19 +1040,7 @@ async def wait_and_check_otp(context, user_id, number, country, chat_id, message
                 f"{MAIN_CHANNEL}",
                 parse_mode=ParseMode.MARKDOWN)
             
-            # Update user message
-            text, kb = get_otp_result_keyboard(number, country, otp, service, user_balances[user_id])
-            try:
-                await context.bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=message_id,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=kb
-                )
-            except:
-                pass
-            
+            # Send to user DM (full number)
             await context.bot.send_message(user_id,
                 f"🔐 *OTP Received!*\n\n"
                 f"📱 *Number:* `{number}`\n"
@@ -1119,9 +1049,15 @@ async def wait_and_check_otp(context, user_id, number, country, chat_id, message
                 f"💰 *+{price} TK added!*\n"
                 f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
                 parse_mode=ParseMode.MARKDOWN)
+            
+            # Remove from active numbers after OTP received
+            if user_id in user_active_numbers:
+                if number in user_active_numbers[user_id]['numbers']:
+                    user_active_numbers[user_id]['numbers'].remove(number)
+            
+            if number in otp_check_tasks:
+                del otp_check_tasks[number]
             return
-    
-    await context.bot.send_message(user_id, "⏳ OTP not received yet. Please try checking again or get a new number.", parse_mode=ParseMode.MARKDOWN)
 
 # ==================== BACKGROUND TASKS ====================
 async def auto_refresh_2fa(context, chat_id, user_id, message_id):
@@ -1398,7 +1334,7 @@ async def admin_commands(update, context):
         if web_panel.login():
             await update.message.reply_text("✅ Web panel login successful!")
         else:
-            await update.message.reply_text("❌ Web panel login failed!")
+            await update.message.reply_text("❌ Web panel login failed! Check credentials.")
     
     # Handle file upload for bulk numbers
     if update.message.document:
@@ -1466,6 +1402,17 @@ def health():
 
 # ==================== MAIN ====================
 if __name__ == '__main__':
+    # First, stop any existing bot instance
+    try:
+        import asyncio
+        import telegram
+        bot = telegram.Bot(BOT_TOKEN)
+        # Remove webhook to avoid conflicts
+        bot.delete_webhook()
+        print("✅ Webhook deleted")
+    except:
+        pass
+    
     application = Application.builder().token(BOT_TOKEN).build()
     
     conv_handler = ConversationHandler(
@@ -1490,5 +1437,5 @@ if __name__ == '__main__':
             application.bot.set_webhook(url)
         flask_app.run(host='0.0.0.0', port=port)
     else:
-        print("🤖 GetPaid OTP 2.0 Bot is running...")
+        print("🤖 OTP SERVICE BOT is running...")
         application.run_polling()
