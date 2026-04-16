@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3700+ lines)
+# otp_service_bot.py - Complete Final Working Script (3800+ lines)
 import os
 import re
 import json
@@ -905,8 +905,8 @@ async def callback_handler(update, context):
         
         # Start OTP checking for all selected numbers
         for num in selected_numbers:
-            if num not in otp_check_tasks:
-                otp_check_tasks[num] = asyncio.create_task(continuous_otp_check(context, user_id, num, country))
+            task = asyncio.create_task(continuous_otp_check(context, user_id, num, country))
+            otp_check_tasks[f"{user_id}_{num}"] = task
         return
     
     # ==================== 2FA CALLBACKS ====================
@@ -1001,27 +1001,31 @@ async def callback_handler(update, context):
         return
 
 async def continuous_otp_check(context, user_id, number, country):
-    """Continuously check for OTP on a number"""
-    for attempt in range(40):
+    """Continuously check for OTP on a number and forward to user"""
+    for attempt in range(45):  # Check for 2:15 minutes (45 * 3 seconds)
         await asyncio.sleep(3)
         
+        # Check if user still has this number active
         if user_id not in user_active_numbers:
             return
         if number not in user_active_numbers[user_id].get('numbers', []):
             return
         
+        # Get OTP from web panel
         result = web_panel.get_otp(number)
         if result and result.get('otp'):
             otp = result['otp']
             service = result.get('service', 'FACEBOOK')
             price = country_prices.get(country, 0.30)
             
+            # Add balance to user
             user_balances[user_id] = user_balances.get(user_id, 0) + price
             if user_id not in user_stats:
                 user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
             user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
             user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
             
+            # Record transaction
             if user_id not in user_transactions:
                 user_transactions[user_id] = []
             user_transactions[user_id].append({
@@ -1033,36 +1037,63 @@ async def continuous_otp_check(context, user_id, number, country):
             
             # Send to OTP Group (masked number)
             masked_for_group = number[:4] + "****" + number[-4:] if len(number) > 8 else number
-            await context.bot.send_message(OTP_GROUP,
-                f"🔐 *OTP SERVICE | OTP RCV*\n\n"
-                f"📱 *Number:* `{masked_for_group}`\n"
-                f"🌍 *Country:* {country}\n"
-                f"🔧 *Service:* {service}\n\n"
-                f"✅ *Status:* CLAIMED\n\n"
-                f"🔑 *OTP Code:* `{otp}`\n\n"
-                f"আপনার ব্যালেন্স +{price} যোগ হবে।\n"
-                f"মোট ব্যালেন্স: {user_balances[user_id]:.2f} TK\n\n"
-                f"`{otp} is your {service} password reset code ❗️`\n\n"
-                f"{MAIN_CHANNEL}",
-                parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_message(
+                    OTP_GROUP,
+                    f"🔐 *OTP SERVICE | OTP RCV*\n\n"
+                    f"📱 *Number:* `{masked_for_group}`\n"
+                    f"🌍 *Country:* {country}\n"
+                    f"🔧 *Service:* {service}\n\n"
+                    f"✅ *Status:* CLAIMED\n\n"
+                    f"🔑 *OTP Code:* `{otp}`\n\n"
+                    f"আপনার ব্যালেন্স +{price} যোগ হবে।\n"
+                    f"মোট ব্যালেন্স: {user_balances[user_id]:.2f} TK\n\n"
+                    f"`{otp} is your {service} password reset code ❗️`\n\n"
+                    f"{MAIN_CHANNEL}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                print(f"Failed to send to group: {e}")
             
             # Send to user DM (full number)
-            await context.bot.send_message(user_id,
-                f"🔐 *OTP Received!*\n\n"
-                f"📱 *Number:* `{number}`\n"
-                f"🔧 *Service:* {service}\n"
-                f"🔑 *OTP:* `{otp}`\n\n"
-                f"💰 *+{price} TK added!*\n"
-                f"💵 *New Balance:* {user_balances[user_id]:.2f} TK",
-                parse_mode=ParseMode.MARKDOWN)
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"🔐 *OTP Received!*\n\n"
+                    f"📱 *Number:* `{number}`\n"
+                    f"🔧 *Service:* {service}\n"
+                    f"🔑 *OTP:* `{otp}`\n\n"
+                    f"💰 *+{price} TK added!*\n"
+                    f"💵 *New Balance:* {user_balances[user_id]:.2f} TK\n\n"
+                    f"📢 Join: {MAIN_CHANNEL} | {OTP_GROUP}",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                print(f"Failed to send to user: {e}")
             
+            # Remove from active numbers after OTP received
             if user_id in user_active_numbers:
                 if number in user_active_numbers[user_id]['numbers']:
                     user_active_numbers[user_id]['numbers'].remove(number)
             
-            if number in otp_check_tasks:
-                del otp_check_tasks[number]
+            # Mark number as used completely
+            number_usage_count[number] = number_usage_count.get(number, 0) + 1
+            save_data()
+            
+            # Cancel this check task
+            task_key = f"{user_id}_{number}"
+            if task_key in otp_check_tasks:
+                del otp_check_tasks[task_key]
             return
+    
+    # If OTP not received after all attempts
+    if user_id in user_active_numbers and number in user_active_numbers[user_id].get('numbers', []):
+        user_active_numbers[user_id]['numbers'].remove(number)
+        await context.bot.send_message(
+            user_id,
+            f"⏰ *OTP not received for {number}*\n\nPlease try getting a new number.",
+            parse_mode=ParseMode.MARKDOWN
+        )
 
 # ==================== BACKGROUND TASKS ====================
 async def auto_refresh_2fa(context, chat_id, user_id, message_id):
