@@ -21,7 +21,7 @@ from telegram.constants import ParseMode
 from bs4 import BeautifulSoup
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "8343363851:AAEE8FbOno5w-FPmF-JdglznbeS2_tElBd4"
+BOT_TOKEN = "8343363851:AAHmFXkTjrubOpW3VdsZAhebvzfNyjNpJ10"
 ADMIN_ID = 7064572216
 BOT_USERNAME = "GetPaidOTP2Bot"
 MAIN_CHANNEL = "@OtpService2C"
