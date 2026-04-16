@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Production Ready Bot
+# otp_service_bot.py - Complete Fixed Version (No Mask for Users, Masked in Group)
 import os
 import re
 import json
@@ -58,6 +58,7 @@ user_waiting_for_otp = {}
 last_web_login = 0
 web_session = None
 number_usage_stats = {}
+last_2fa_message_id = {}  # Track 2FA message to avoid duplicates
 
 # ==================== DATA PERSISTENCE ====================
 def load_data():
@@ -189,21 +190,28 @@ class TOTPGenerator:
     def time_left():
         return 30 - (int(time.time()) % 30)
 
-# ==================== NUMBER MASKING ====================
-def mask_number(number):
-    """Mask middle digits, show first 3-4 and last 3 digits"""
+# ==================== NUMBER MASKING (Only for Group) ====================
+def mask_number_for_group(number):
+    """Mask number for group - show first 3-4 digits and last 3 digits only"""
     if len(number) <= 7:
         return number
-    # Keep first 3-4 digits and last 3 digits
     first_part = number[:4] if len(number) > 7 else number[:3]
     last_part = number[-3:]
     masked = first_part + "***" + last_part
     return masked
 
-def unmask_full_number(masked_number, original_numbers):
-    """Find full number from masked version"""
-    for num in original_numbers:
-        if mask_number(num) == masked_number:
+def get_full_number_from_masked(masked_number, user_numbers):
+    """Find full number from masked version by matching pattern"""
+    # Extract pattern from masked: e.g., "017***456"
+    pattern_parts = masked_number.split('***')
+    if len(pattern_parts) != 2:
+        return None
+    
+    first_part = pattern_parts[0]
+    last_part = pattern_parts[1]
+    
+    for num in user_numbers:
+        if num.startswith(first_part) and num.endswith(last_part):
             return num
     return None
 
@@ -238,7 +246,7 @@ def get_country_selection_keyboard(countries):
     return InlineKeyboardMarkup(keyboard)
 
 def get_numbers_post_keyboard(numbers, country):
-    """Create post with numbers as text, buttons below"""
+    """Create post with unmasked numbers as text, buttons below"""
     keyboard = [
         [InlineKeyboardButton("📢 OTP Group", url=f"https://t.me/{OTP_GROUP[1:]}")],
         [InlineKeyboardButton("🔄 Change Number", callback_data=f"change_number_{country}")],
@@ -249,7 +257,7 @@ def get_numbers_post_keyboard(numbers, country):
 def get_otp_check_keyboard(number, country):
     keyboard = [
         [InlineKeyboardButton("🔄 Check OTP", callback_data=f"check_otp_{number}")],
-        [InlineKeyboardButton("📢 OTP Group", url=f"https://t.me/{OTP_GROUP[1:]}")],
+        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{MAIN_CHANNEL[1:]}")],
         [InlineKeyboardButton("🔄 Change Number", callback_data=f"change_number_{country}")],
         [InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")]
     ]
@@ -340,9 +348,11 @@ async def handle_message(update, context):
             save_data()
             context.user_data['awaiting_2fa'] = False
             
+            # Cancel existing task if any
             if '2fa_task' in context.user_data:
                 context.user_data['2fa_task'].cancel()
             
+            # Start new auto-refresh task
             task = asyncio.create_task(auto_refresh_2fa(context, update.message.chat_id, user_id))
             context.user_data['2fa_task'] = task
             
@@ -525,7 +535,7 @@ async def handle_message(update, context):
                 msg += f"*{country}:* মোট: {len(nums)} | উপলব্ধ: {available_count} | ব্যবহৃত: {used} (প্রতি OTP: {price} TK)\n"
                 for num in nums[:5]:
                     status = "✅" if not number_usage_stats.get(num, {}).get('used', False) else "❌"
-                    msg += f"  {status} `{mask_number(num)}`\n"
+                    msg += f"  {status} `{num}`\n"
                 msg += "\n"
             
             if len(msg) > 4000:
@@ -573,6 +583,7 @@ async def handle_message(update, context):
         total_earned = sum(s.get('total_earned', 0) for s in user_stats.values())
         total_otps = sum(s.get('total_otps', 0) for s in user_stats.values())
         total_numbers = sum(len(nums) for nums in available_numbers.values())
+        used_numbers = sum(1 for stats in number_usage_stats.values() if stats.get('used', False))
         await update.message.reply_text(
             f"📊 *পরিসংখ্যান*\n\n"
             f"👥 ইউজার: {total_users}\n"
@@ -580,6 +591,8 @@ async def handle_message(update, context):
             f"💵 মোট আয়: {total_earned:.2f} TK\n"
             f"🔑 মোট OTP: {total_otps}\n"
             f"📱 মোট নম্বর: {total_numbers}\n"
+            f"✅ ব্যবহৃত নম্বর: {used_numbers}\n"
+            f"🆓 উপলব্ধ নম্বর: {total_numbers - used_numbers}\n"
             f"🌍 মোট দেশ: {len(available_numbers)}",
             parse_mode=ParseMode.MARKDOWN
         )
@@ -697,12 +710,11 @@ async def callback_handler(update, context):
         )
         return
     
-    # User select country
+    # User select country - Show UNMASKED numbers to user
     elif data.startswith("select_country_"):
         country = data.replace("select_country_", "")
         user_selected_country[user_id] = country
         
-        # Get available numbers for this country (only unused ones)
         all_numbers = available_numbers.get(country, [])
         unused_numbers = [num for num in all_numbers if not number_usage_stats.get(num, {}).get('used', False)]
         
@@ -717,7 +729,6 @@ async def callback_handler(update, context):
             )
             return
         
-        # Select 3 random unused numbers
         selected_numbers = random.sample(unused_numbers, min(3, len(unused_numbers)))
         user_current_numbers[user_id] = {
             'numbers': selected_numbers,
@@ -725,13 +736,12 @@ async def callback_handler(update, context):
             'selected_time': time.time()
         }
         
-        # Create post with numbers as text
+        # Show FULL NUMBERS (NOT MASKED) to user
         numbers_text = ""
         for idx, num in enumerate(selected_numbers, 1):
-            masked = mask_number(num)
-            numbers_text += f"{idx}. `{masked}`\n"
+            numbers_text += f"{idx}. `{num}`\n"
         
-        message_text = f"✅ *{country} দেশের নম্বর*\n\n{numbers_text}\n\n👇 *যেকোনো নম্বর কপি করতে উপরের নম্বরে ক্লিক করুন*\n\n⏳ *ওয়েটিং ফর ওটিপি...*\nনম্বর কপি করে যেখানে প্রয়োজন সেখানে ব্যবহার করুন। OTP আসার পর নিচের চেক বাটন ব্যবহার করুন।"
+        message_text = f"✅ *{country} দেশের নম্বর*\n\n{numbers_text}\n\n👇 *যেকোনো নম্বর কপি করতে উপরের নম্বরে ক্লিক করুন*\n\n⏳ *ওয়েটিং ফর ওটিপি...*\nনম্বর কপি করে যেখানে প্রয়োজন সেখানে ব্যবহার করুন।"
         
         await query.edit_message_text(
             message_text,
@@ -739,7 +749,6 @@ async def callback_handler(update, context):
             reply_markup=get_numbers_post_keyboard(selected_numbers, country)
         )
         
-        # Store that user is waiting for OTP on these numbers
         user_waiting_for_otp[user_id] = {
             'numbers': selected_numbers,
             'country': country,
@@ -752,11 +761,10 @@ async def callback_handler(update, context):
             asyncio.create_task(check_otp_background(context, user_id, number, country))
         return
     
-    # Change number (get new numbers for same country)
+    # Change number - Show UNMASKED numbers to user
     elif data.startswith("change_number_"):
         country = data.replace("change_number_", "")
         
-        # Get available unused numbers
         all_numbers = available_numbers.get(country, [])
         unused_numbers = [num for num in all_numbers if not number_usage_stats.get(num, {}).get('used', False)]
         
@@ -771,7 +779,6 @@ async def callback_handler(update, context):
             )
             return
         
-        # Select new 3 numbers
         selected_numbers = random.sample(unused_numbers, min(3, len(unused_numbers)))
         user_current_numbers[user_id] = {
             'numbers': selected_numbers,
@@ -779,14 +786,13 @@ async def callback_handler(update, context):
             'selected_time': time.time()
         }
         
-        # Clear old waiting status
         if user_id in user_waiting_for_otp:
             del user_waiting_for_otp[user_id]
         
+        # Show FULL NUMBERS (NOT MASKED) to user
         numbers_text = ""
         for idx, num in enumerate(selected_numbers, 1):
-            masked = mask_number(num)
-            numbers_text += f"{idx}. `{masked}`\n"
+            numbers_text += f"{idx}. `{num}`\n"
         
         message_text = f"✅ *{country} দেশের নতুন নম্বর*\n\n{numbers_text}\n\n👇 *যেকোনো নম্বর কপি করতে উপরের নম্বরে ক্লিক করুন*\n\n⏳ *ওয়েটিং ফর ওটিপি...*"
         
@@ -817,11 +823,10 @@ async def callback_handler(update, context):
         )
         return
     
-    # Check OTP for a specific number
+    # Check OTP
     elif data.startswith("check_otp_"):
         number = data.replace("check_otp_", "")
         
-        # Find which user this number belongs to
         target_user = None
         for uid, info in user_waiting_for_otp.items():
             if number in info.get('numbers', []):
@@ -836,13 +841,12 @@ async def callback_handler(update, context):
             await query.answer("এই নম্বরটি অন্য ব্যবহারকারী ব্যবহার করছে।", show_alert=True)
             return
         
-        # Check if OTP was already received
         if user_id in active_orders and active_orders.get(user_id, {}).get('number') == number and active_orders.get(user_id, {}).get('otp'):
             otp_data = active_orders[user_id]
             price = country_prices.get(otp_data.get('country', 'Unknown'), 0.30)
             await query.edit_message_text(
                 f"✅ *OTP প্রাপ্ত হয়েছে!*\n\n"
-                f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                f"📱 *নম্বর:* `{number}`\n"
                 f"🔧 *সার্ভিস:* {otp_data.get('service', 'Unknown')}\n\n"
                 f"🔑 *OTP কোড:* `{otp_data['otp']}` ✅\n\n"
                 f"💰 *আয় হয়েছে:* +{price} TK\n"
@@ -851,7 +855,6 @@ async def callback_handler(update, context):
                 reply_markup=get_otp_check_keyboard(number, otp_data.get('country', 'Unknown'))
             )
         else:
-            # Try to get OTP from web panel
             result = web_panel.get_otp(number)
             if result and result.get('otp'):
                 otp = result['otp']
@@ -859,21 +862,18 @@ async def callback_handler(update, context):
                 country = user_waiting_for_otp.get(user_id, {}).get('country', 'Unknown')
                 price = country_prices.get(country, 0.30)
                 
-                # Add balance
                 user_balances[user_id] = user_balances.get(user_id, 0) + price
                 if user_id not in user_stats:
                     user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
                 user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
                 user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
                 
-                # Mark number as used
                 if number not in number_usage_stats:
                     number_usage_stats[number] = {'used': False, 'used_by': None, 'used_time': None}
                 number_usage_stats[number]['used'] = True
                 number_usage_stats[number]['used_by'] = user_id
                 number_usage_stats[number]['used_time'] = datetime.now().isoformat()
                 
-                # Record transaction
                 if user_id not in user_transactions:
                     user_transactions[user_id] = []
                 user_transactions[user_id].append({
@@ -883,18 +883,16 @@ async def callback_handler(update, context):
                 })
                 save_data()
                 
-                # Store in active orders
                 active_orders[user_id] = {
                     'number': number, 'country': country, 'otp': otp, 'service': service
                 }
                 
-                # Update waiting status
                 if user_id in user_waiting_for_otp:
                     user_waiting_for_otp[user_id]['otp_received'] = True
                 
                 await query.edit_message_text(
                     f"✅ *OTP প্রাপ্ত হয়েছে!*\n\n"
-                    f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                    f"📱 *নম্বর:* `{number}`\n"
                     f"🔧 *সার্ভিস:* {service}\n\n"
                     f"🔑 *OTP কোড:* `{otp}` ✅\n\n"
                     f"💰 *আয় হয়েছে:* +{price} TK\n"
@@ -903,10 +901,11 @@ async def callback_handler(update, context):
                     reply_markup=get_otp_check_keyboard(number, country)
                 )
                 
-                # Send to OTP group with masked number
+                # Send to OTP Group with MASKED number
+                masked_number = mask_number_for_group(number)
                 await context.bot.send_message(OTP_GROUP,
                     f"🔐 *OTP Service | OTP প্রাপ্ত*\n\n"
-                    f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                    f"📱 *নম্বর:* `{masked_number}`\n"
                     f"🌍 *দেশ:* {country}\n"
                     f"🔧 *সার্ভিস:* {service}\n"
                     f"✅ *স্ট্যাটাস:* প্রাপ্ত\n"
@@ -915,10 +914,10 @@ async def callback_handler(update, context):
                     f"🔗 @{BOT_USERNAME} | {MAIN_CHANNEL}",
                     parse_mode=ParseMode.MARKDOWN)
                 
-                # Send to user
+                # Send to user privately
                 await context.bot.send_message(user_id,
                     f"🔐 *OTP প্রাপ্ত!*\n\n"
-                    f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                    f"📱 *নম্বর:* `{number}`\n"
                     f"🔧 *সার্ভিস:* {service}\n"
                     f"🔑 *OTP:* `{otp}`\n\n"
                     f"💰 *+{price} TK যোগ হয়েছে!*\n"
@@ -928,7 +927,7 @@ async def callback_handler(update, context):
                 await query.answer("OTP এখনো আসেনি। আরও 1-2 মিনিট অপেক্ষা করুন।", show_alert=True)
         return
     
-    # ==================== 2FA CALLBACKS ====================
+    # 2FA CALLBACKS
     elif data == "2fa_refresh":
         if user_id in totp_secrets:
             secret = totp_secrets[user_id]
@@ -960,7 +959,10 @@ async def callback_handler(update, context):
 
 # ==================== BACKGROUND TASKS ====================
 async def auto_refresh_2fa(context, chat_id, user_id):
+    """Auto refresh 2FA code - sends only ONE message"""
     message_id = None
+    first_run = True
+    
     while user_id in totp_secrets:
         await asyncio.sleep(1)
         if user_id in totp_secrets:
@@ -970,6 +972,7 @@ async def auto_refresh_2fa(context, chat_id, user_id):
             kb = get_2fa_display_keyboard(secret, code, remaining)
             
             try:
+                # Only edit existing message, don't send new ones
                 if message_id:
                     await context.bot.edit_message_text(
                         chat_id=chat_id,
@@ -982,7 +985,8 @@ async def auto_refresh_2fa(context, chat_id, user_id):
                         parse_mode=ParseMode.MARKDOWN,
                         reply_markup=kb
                     )
-                else:
+                elif first_run:
+                    # Send initial message only once
                     msg = await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"🔐 *2FA অথেনটিকেটর*\n\n"
@@ -994,22 +998,21 @@ async def auto_refresh_2fa(context, chat_id, user_id):
                         reply_markup=kb
                     )
                     message_id = msg.message_id
-            except:
+                    first_run = False
+            except Exception as e:
                 pass
 
 async def check_otp_background(context, user_id, number, country):
     """Background task to check OTP for a number"""
-    for attempt in range(60):  # Check for 3 minutes (60 * 3 seconds)
+    for attempt in range(60):  # Check for 3 minutes
         await asyncio.sleep(3)
         
-        # Check if user is still waiting for this number
         if user_id not in user_waiting_for_otp:
             return
         
         if user_waiting_for_otp[user_id].get('otp_received', False):
             return
         
-        # Check if number is still in user's list
         if number not in user_waiting_for_otp[user_id].get('numbers', []):
             return
         
@@ -1019,21 +1022,18 @@ async def check_otp_background(context, user_id, number, country):
             service = result.get('service', 'Unknown')
             price = country_prices.get(country, 0.30)
             
-            # Add balance
             user_balances[user_id] = user_balances.get(user_id, 0) + price
             if user_id not in user_stats:
                 user_stats[user_id] = {'total_otps': 0, 'total_earned': 0}
             user_stats[user_id]['total_otps'] = user_stats[user_id].get('total_otps', 0) + 1
             user_stats[user_id]['total_earned'] = user_stats[user_id].get('total_earned', 0) + price
             
-            # Mark number as used
             if number not in number_usage_stats:
                 number_usage_stats[number] = {'used': False, 'used_by': None, 'used_time': None}
             number_usage_stats[number]['used'] = True
             number_usage_stats[number]['used_by'] = user_id
             number_usage_stats[number]['used_time'] = datetime.now().isoformat()
             
-            # Record transaction
             if user_id not in user_transactions:
                 user_transactions[user_id] = []
             user_transactions[user_id].append({
@@ -1043,18 +1043,17 @@ async def check_otp_background(context, user_id, number, country):
             })
             save_data()
             
-            # Store in active orders
             active_orders[user_id] = {
                 'number': number, 'country': country, 'otp': otp, 'service': service
             }
             
-            # Update waiting status
             user_waiting_for_otp[user_id]['otp_received'] = True
             
-            # Send to OTP group with masked number
+            # Send to OTP Group with MASKED number
+            masked_number = mask_number_for_group(number)
             await context.bot.send_message(OTP_GROUP,
                 f"🔐 *OTP Service | OTP প্রাপ্ত*\n\n"
-                f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                f"📱 *নম্বর:* `{masked_number}`\n"
                 f"🌍 *দেশ:* {country}\n"
                 f"🔧 *সার্ভিস:* {service}\n"
                 f"✅ *স্ট্যাটাস:* প্রাপ্ত\n"
@@ -1063,10 +1062,10 @@ async def check_otp_background(context, user_id, number, country):
                 f"🔗 @{BOT_USERNAME} | {MAIN_CHANNEL}",
                 parse_mode=ParseMode.MARKDOWN)
             
-            # Send notification to user
+            # Send to user privately with FULL number
             await context.bot.send_message(user_id,
                 f"🔐 *OTP প্রাপ্ত!*\n\n"
-                f"📱 *নম্বর:* `{mask_number(number)}`\n"
+                f"📱 *নম্বর:* `{number}`\n"
                 f"🔧 *সার্ভিস:* {service}\n"
                 f"🔑 *OTP:* `{otp}`\n\n"
                 f"💰 *+{price} TK যোগ হয়েছে!*\n"
@@ -1293,7 +1292,7 @@ async def admin_commands(update, context):
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('Country') and not line.startswith('দেশ') and not line.startswith('+'):
+                if line and not line.startswith('Country') and not line.startswith('দেশ'):
                     num = line
                     if not num.startswith('+'):
                         num = '+' + num
@@ -1370,7 +1369,6 @@ if __name__ == '__main__':
     application.add_handler(MessageHandler(filters.TEXT & filters.COMMAND, admin_commands))
     application.add_handler(MessageHandler(filters.Document.ALL, admin_commands))
     
-    # Login to web panel on startup
     web_panel.login()
     
     if os.environ.get('PORT'):
