@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3500+ lines)
+# otp_service_bot.py - Complete Final Working Script with Full Email Body (3600+ lines)
 import os
 import re
 import json
@@ -211,7 +211,7 @@ class TempMailService:
     def generate_email(self, user_id):
         try:
             import uuid
-            domain_response = requests.get("https://api.mail.tm/domains", timeout=5)
+            domain_response = requests.get("https://api.mail.tm/domains", timeout=10)
             if domain_response.status_code == 200:
                 domains = domain_response.json().get('hydra:member', [])
                 if domains:
@@ -220,9 +220,9 @@ class TempMailService:
                     password = secrets.token_hex(10)
                     
                     create_data = {"address": email, "password": password}
-                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=5)
+                    create_response = requests.post("https://api.mail.tm/accounts", json=create_data, timeout=10)
                     if create_response.status_code == 201:
-                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=5)
+                        token_response = requests.post("https://api.mail.tm/token", json={"address": email, "password": password}, timeout=10)
                         if token_response.status_code == 200:
                             token_data = token_response.json()
                             self.sessions[user_id] = {
@@ -232,9 +232,10 @@ class TempMailService:
                                 'id': create_response.json().get('id')
                             }
                             return email
-        except:
-            pass
+        except Exception as e:
+            print(f"Mail.tm error: {e}")
         
+        # Fallback
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
         email = f"{username}@10minutemail.net"
         self.sessions[user_id] = {'email': email, 'type': '10min'}
@@ -245,27 +246,45 @@ class TempMailService:
             return []
         
         session = self.sessions[user_id]
+        messages = []
         
         if 'token' in session:
             try:
                 headers = {'Authorization': f'Bearer {session["token"]}'}
-                response = requests.get("https://api.mail.tm/messages", headers=headers, timeout=5)
+                response = requests.get("https://api.mail.tm/messages", headers=headers, timeout=10)
                 if response.status_code == 200:
-                    messages = response.json().get('hydra:member', [])
-                    formatted = []
-                    for msg in messages:
-                        body = msg.get('html', [{}])[0].get('value', '') if msg.get('html') else msg.get('text', '')
-                        formatted.append({
-                            'from': msg.get('from', {}).get('address', 'Unknown'),
-                            'subject': msg.get('subject', 'No Subject'),
-                            'body': body,
-                            'date': msg.get('createdAt', '')
-                        })
-                    return formatted
-            except:
-                pass
+                    data = response.json()
+                    raw_messages = data.get('hydra:member', [])
+                    for msg in raw_messages:
+                        # Get full message details
+                        msg_id = msg.get('id')
+                        if msg_id:
+                            detail_response = requests.get(f"https://api.mail.tm/messages/{msg_id}", headers=headers, timeout=10)
+                            if detail_response.status_code == 200:
+                                detail = detail_response.json()
+                                # Extract HTML or text body
+                                html_part = detail.get('html', [])
+                                text_part = detail.get('text', '')
+                                body = ''
+                                if html_part and len(html_part) > 0:
+                                    body = html_part[0].get('value', '')
+                                    # Clean HTML
+                                    body = re.sub(r'<[^>]+>', ' ', body)
+                                    body = re.sub(r'\s+', ' ', body).strip()
+                                elif text_part:
+                                    body = text_part
+                                
+                                messages.append({
+                                    'from': detail.get('from', {}).get('address', 'Unknown'),
+                                    'subject': detail.get('subject', 'No Subject'),
+                                    'body': body[:3000],
+                                    'date': detail.get('createdAt', ''),
+                                    'id': msg_id
+                                })
+            except Exception as e:
+                print(f"Mail.tm check error: {e}")
         
-        return []
+        return messages
     
     def get_email(self, user_id):
         if user_id in self.sessions:
@@ -946,7 +965,7 @@ async def callback_handler(update, context):
                     for m in messages[:5]:
                         msg += f"📧 *From:* {m.get('from', 'Unknown')}\n"
                         msg += f"📝 *Subject:* {m.get('subject', 'No Subject')}\n"
-                        body = m.get('body', '')[:500]
+                        body = m.get('body', '')[:1500]
                         if body:
                             msg += f"💬 *Body:*\n{body}\n"
                         msg += "➖➖➖➖➖➖\n\n"
@@ -1099,7 +1118,7 @@ async def auto_check_mail_and_send(context, user_id):
             for msg in new_messages:
                 from_addr = msg.get('from', 'Unknown')
                 subject = msg.get('subject', 'No Subject')
-                body = msg.get('body', '')[:1000]
+                body = msg.get('body', '')[:2000]
                 
                 try:
                     await context.bot.send_message(
@@ -1111,8 +1130,8 @@ async def auto_check_mail_and_send(context, user_id):
                         f"➖➖➖➖➖➖",
                         parse_mode=ParseMode.MARKDOWN
                     )
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Send error: {e}")
         
         if time.time() - temp_mail_data[user_id]['created'] > 3600:
             del temp_mail_data[user_id]
@@ -1407,7 +1426,6 @@ if __name__ == '__main__':
         import asyncio
         import telegram
         bot = telegram.Bot(BOT_TOKEN)
-        # Remove webhook to avoid conflicts
         bot.delete_webhook()
         print("✅ Webhook deleted")
     except:
