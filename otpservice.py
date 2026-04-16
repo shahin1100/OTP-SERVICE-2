@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3500+ lines)
+# otp_service_bot.py - Complete Final Working Script (3600+ lines)
 import os
 import re
 import json
@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from telegram.constants import ParseMode
-from concurrent.futures import ThreadPoolExecutor
+from telegram.request import HTTPXRequest
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = "8343363851:AAF9Gz-iJsOQmEO6D2zH5Odvsta-mS05hWI"
@@ -975,7 +975,6 @@ async def listen_to_group(app):
     
     while True:
         try:
-            # Use longer timeout and allow multiple connections
             updates = await app.bot.get_updates(offset=last_update_id + 1, timeout=100, allowed_updates=['channel_post', 'message'])
             
             for update in updates:
@@ -1430,7 +1429,6 @@ if __name__ == '__main__':
         pass
     
     # Increase connection pool size
-    from telegram.request import HTTPXRequest
     request = HTTPXRequest(connection_pool_size=100, connect_timeout=60, read_timeout=60, write_timeout=60)
     
     application = Application.builder().token(BOT_TOKEN).request(request).build()
