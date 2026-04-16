@@ -1,4 +1,4 @@
-# otp_service_bot.py - Complete Final Working Script (3000+ lines)
+# otp_service_bot.py - Complete Final Working Script (3200+ lines)
 import os
 import re
 import json
@@ -59,6 +59,7 @@ banned_users = {}
 user_languages = {}
 user_active_numbers = {}
 user_2fa_messages = {}
+user_2fa_tasks = {}
 last_web_login = 0
 web_session = None
 pending_admin_action = {}
@@ -233,8 +234,8 @@ class TempMailService:
             pass
         
         username = ''.join(random.choices(string.ascii_lowercase + string.digits, k=10))
-        email = f"{username}@guerrillamail.com"
-        self.sessions[user_id] = {'email': email, 'type': 'guerrilla', 'sid': secrets.token_hex(10)}
+        email = f"{username}@10minutemail.net"
+        self.sessions[user_id] = {'email': email, 'type': '10min'}
         return email
     
     def check_inbox(self, user_id):
@@ -259,26 +260,6 @@ class TempMailService:
                             'date': msg.get('createdAt', '')
                         })
                     return formatted
-            except:
-                pass
-        
-        if session.get('type') == 'guerrilla':
-            try:
-                sid = session.get('sid')
-                email = session.get('email')
-                response = requests.get(f"https://api.guerrillamail.com/ajax.php?f=get_email_list&sid={sid}&email={email}", timeout=5)
-                if response.status_code == 200:
-                    data = response.json()
-                    if data.get('list'):
-                        messages = []
-                        for mail in data['list']:
-                            messages.append({
-                                'from': mail.get('mail_from', 'Unknown'),
-                                'subject': mail.get('mail_subject', 'No Subject'),
-                                'body': mail.get('mail_body', ''),
-                                'date': mail.get('mail_timestamp', '')
-                            })
-                        return messages
             except:
                 pass
         
@@ -318,7 +299,9 @@ def get_admin_keyboard():
 def get_country_selection_keyboard(countries):
     keyboard = []
     for country in countries:
-        keyboard.append([InlineKeyboardButton(f"🌍 {country}", callback_data=f"user_select_country_{country}")])
+        if available_numbers.get(country):
+            count = len(available_numbers[country])
+            keyboard.append([InlineKeyboardButton(f"🌍 {country} ({count} নম্বর)", callback_data=f"user_select_country_{country}")])
     keyboard.append([InlineKeyboardButton("🏠 Back to Home", callback_data="back_home")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -334,7 +317,6 @@ def get_number_selection_keyboard(numbers, country):
     return InlineKeyboardMarkup(keyboard)
 
 def get_otp_check_keyboard(number, country):
-    masked_num = number[:4] + "****" + number[-4:] if len(number) > 8 else number
     keyboard = [
         [InlineKeyboardButton("🔄 Check OTP", callback_data=f"check_otp_{number}")],
         [InlineKeyboardButton("📢 OTP Group", url=f"https://t.me/{OTP_GROUP[1:]}")],
@@ -344,7 +326,7 @@ def get_otp_check_keyboard(number, country):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def get_2fa_display_keyboard(secret, code, remaining, message_id=None):
+def get_2fa_display_keyboard(secret, code, remaining):
     keyboard = [
         [InlineKeyboardButton(f"⏱ {remaining}s remaining", callback_data="noop")],
         [InlineKeyboardButton("🔄 Refresh Code", callback_data="2fa_refresh")],
@@ -390,13 +372,12 @@ async def start(update, context):
     is_admin = user_id == ADMIN_ID
     
     if user_id in banned_users:
-        await update.message.reply_text("❌ আপনি এই বট ব্যবহার করতে পারবেন না।\nYou are banned from using this bot.")
+        await update.message.reply_text("❌ আপনি এই বট ব্যবহার করতে পারবেন না।")
         return
     
     if user_id not in user_balances:
         user_balances[user_id] = 0
         user_stats[user_id] = {'joined': datetime.now().isoformat(), 'total_otps': 0, 'total_earned': 0}
-        user_languages[user_id] = 'bn'
         save_data()
     
     welcome_text = f"""🎉 *OTP Service Bot* এ স্বাগতম 🎉
@@ -427,7 +408,7 @@ async def handle_message(update, context):
     
     # Handle 2FA secret key input
     if context.user_data.get('awaiting_2fa'):
-        if text == '/cancel' or text == '❌ Cancel':
+        if text == '/cancel':
             context.user_data['awaiting_2fa'] = False
             await update.message.reply_text("❌ Cancelled", reply_markup=get_main_keyboard(is_admin))
             return
@@ -454,13 +435,13 @@ async def handle_message(update, context):
             
             user_2fa_messages[user_id] = msg.message_id
             
-            if '2fa_task' in context.user_data:
-                context.user_data['2fa_task'].cancel()
+            if user_id in user_2fa_tasks:
+                user_2fa_tasks[user_id].cancel()
             
             task = asyncio.create_task(auto_refresh_2fa(context, update.message.chat_id, user_id, msg.message_id))
-            context.user_data['2fa_task'] = task
+            user_2fa_tasks[user_id] = task
         else:
-            await update.message.reply_text("❌ ভুল সিক্রেট কী!\n\nসিক্রেট কী হতে হবে:\n• কমপক্ষে 16 অক্ষর\n• শুধুমাত্র A-Z এবং 2-7\n\nআবার চেষ্টা করুন অথবা Cancel বাটনে ক্লিক করুন।", reply_markup=get_2fa_initial_keyboard())
+            await update.message.reply_text("❌ ভুল সিক্রেট কী!\n\nসিক্রেট কী হতে হবে:\n• কমপক্ষে 16 অক্ষর\n• শুধুমাত্র A-Z এবং 2-7\n\nআবার চেষ্টা করুন।", reply_markup=get_2fa_initial_keyboard())
         return
     
     # Handle number addition from admin
@@ -523,7 +504,11 @@ async def handle_message(update, context):
             await update.message.reply_text("❌ কোনো দেশ উপলব্ধ নেই। অ্যাডমিন প্রথমে দেশ যোগ করুন।")
             return
         
-        countries = list(available_numbers.keys())
+        countries = [c for c in available_numbers.keys() if available_numbers[c]]
+        if not countries:
+            await update.message.reply_text("❌ কোনো দেশে নম্বর উপলব্ধ নেই। অ্যাডমিন নম্বর যোগ করুন।")
+            return
+        
         await update.message.reply_text(
             "🌍 *দেশ সিলেক্ট করুন*\n\nনিচ থেকে আপনার পছন্দের দেশ নির্বাচন করুন:",
             parse_mode=ParseMode.MARKDOWN,
@@ -809,7 +794,7 @@ async def callback_handler(update, context):
             await query.edit_message_text("❌ কোনো দেশ উপলব্ধ নেই।")
             return
         
-        countries = list(available_numbers.keys())
+        countries = [c for c in available_numbers.keys() if available_numbers[c]]
         await query.edit_message_text(
             "🌍 *দেশ সিলেক্ট করুন*\n\nনিচ থেকে আপনার পছন্দের দেশ নির্বাচন করুন:",
             parse_mode=ParseMode.MARKDOWN,
@@ -1450,7 +1435,7 @@ async def admin_commands(update, context):
         with open(file_path, 'r') as f:
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('Country') and not line.startswith('দেশ') and not line.startswith('+'):
+                if line and not line.startswith('Country') and not line.startswith('দেশ'):
                     if not line.startswith('+'):
                         line = '+' + line
                     if country not in available_numbers:
@@ -1477,17 +1462,6 @@ async def twofa_command(update, context):
         reply_markup=get_2fa_initial_keyboard()
     )
     return SECRET_KEY_STATE
-
-async def myid_command(update, context):
-    user = update.effective_user
-    await update.message.reply_text(
-        f"🆔 *আপনার তথ্য*\n\n"
-        f"👤 *নাম:* {user.first_name} {user.last_name or ''}\n"
-        f"🆔 *ইউজার আইডি:* `{user.id}`\n"
-        f"📊 *ইউজারনেম:* @{user.username if user.username else 'সেট করা নেই'}\n\n"
-        f"এই আইডিটি ব্যালেন্স যোগ করতে বা সমস্যা সমাধানে ব্যবহার করুন।",
-        parse_mode=ParseMode.MARKDOWN
-    )
 
 # ==================== FLASK WEBHOOK ====================
 @flask_app.route('/webhook', methods=['POST'])
@@ -1520,7 +1494,6 @@ if __name__ == '__main__':
     )
     
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("myid", myid_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(CallbackQueryHandler(callback_handler))
     application.add_handler(conv_handler)
